@@ -10,12 +10,19 @@ import net.minecraft.block.ShapeContext;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.item.BlockItem;
 import net.minecraft.util.Hand;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.CraftingScreenHandler;
+import net.minecraft.screen.PlayerScreenHandler;
+import net.minecraft.screen.ScreenHandler;
+import net.minecraft.screen.slot.Slot;
+import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.Identifier;
@@ -26,7 +33,9 @@ import net.minecraft.world.RaycastContext;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -37,6 +46,8 @@ import java.util.concurrent.TimeUnit;
 public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private static final String PROTOCOL_VERSION = "1.0.0";
     private static final String BRIDGE_VERSION = "0.1.0";
+    private static final int SCAN_BATCH_SIZE = 2048;
+    private static final BridgeRecipeCatalog RECIPE_CATALOG = BridgeRecipeCatalog.createDefault();
     private static final Set<String> CLEARABLE_SOFT_BLOCKS = Set.of(
         "dirt",
         "grass_block",
@@ -66,6 +77,11 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         "mine-cobblestone",
         "get-block-info",
         "find-block",
+        "place-block",
+        "list-recipes",
+        "get-recipe",
+        "can-craft",
+        "craft-item",
         "detect-gamemode",
         "send-chat"
     );
@@ -107,28 +123,30 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private void executeAction(String requestId, String action, JsonObject args) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        ClientWorld world = client.world;
-
-        if (player == null || world == null) {
+        SessionStateSnapshot sessionState = readSessionStateSnapshotSafely();
+        if (!sessionState.worldReady()) {
             sendError(requestId, "Minecraft world is not ready yet. Join a world or server first.");
             return;
         }
 
         switch (action) {
-            case "get-position" -> handleGetPosition(requestId, player);
-            case "list-inventory" -> handleListInventory(requestId, player);
-            case "find-item" -> handleFindItem(requestId, player, args);
-            case "equip-item" -> handleEquipItem(requestId, player, args);
+            case "get-position" -> handleGetPosition(requestId);
+            case "list-inventory" -> handleListInventory(requestId);
+            case "find-item" -> handleFindItem(requestId, args);
+            case "equip-item" -> handleEquipItem(requestId, args);
             case "move-to-position" -> handleMoveToPosition(requestId, args);
             case "dig-block" -> handleDigBlock(requestId, args);
             case "harvest-wood" -> handleHarvestWood(requestId, args);
             case "mine-cobblestone" -> handleMineCobblestone(requestId, args);
-            case "get-block-info" -> handleGetBlockInfo(requestId, world, args);
-            case "find-block" -> handleFindBlock(requestId, player, world, args);
-            case "detect-gamemode" -> handleDetectGamemode(requestId, client);
-            case "send-chat" -> handleSendChat(requestId, player, args);
+            case "get-block-info" -> handleGetBlockInfo(requestId, args);
+            case "find-block" -> handleFindBlock(requestId, args);
+            case "place-block" -> handlePlaceBlock(requestId, args);
+            case "list-recipes" -> handleListRecipes(requestId, args);
+            case "get-recipe" -> handleGetRecipe(requestId, args);
+            case "can-craft" -> handleCanCraft(requestId, args);
+            case "craft-item" -> handleCraftItem(requestId, args);
+            case "detect-gamemode" -> handleDetectGamemode(requestId);
+            case "send-chat" -> handleSendChat(requestId, args);
             default -> sendError(requestId, "Action '" + action + "' is not yet implemented.");
         }
     }
@@ -140,124 +158,114 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                 "find-item",
                 "get-block-info",
                 "find-block",
+                "list-recipes",
+                "get-recipe",
+                "can-craft",
                 "detect-gamemode" -> ActionCoordinator.Mode.READ_ONLY;
             case "equip-item",
                 "move-to-position",
                 "dig-block",
                 "harvest-wood",
                 "mine-cobblestone",
+                "place-block",
+                "craft-item",
                 "send-chat" -> ActionCoordinator.Mode.EXCLUSIVE;
             default -> ActionCoordinator.Mode.READ_ONLY;
         };
     }
 
-    private void handleGetPosition(String requestId, ClientPlayerEntity player) {
-        JsonObject data = new JsonObject();
-        data.addProperty("x", (int) Math.floor(player.getX()));
-        data.addProperty("y", (int) Math.floor(player.getY()));
-        data.addProperty("z", (int) Math.floor(player.getZ()));
-        sendActionResult(requestId, "Current position: (" + data.get("x").getAsInt() + ", " + data.get("y").getAsInt() + ", " + data.get("z").getAsInt() + ")", data);
+    private void handleGetPosition(String requestId) {
+        try {
+            PositionSnapshot position = callOnClientThread(this::readPlayerPosition);
+            JsonObject data = new JsonObject();
+            data.addProperty("x", position.x());
+            data.addProperty("y", position.y());
+            data.addProperty("z", position.z());
+            sendActionResult(requestId, "Current position: (" + position.x() + ", " + position.y() + ", " + position.z() + ")", data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
     }
 
-    private void handleListInventory(String requestId, ClientPlayerEntity player) {
-        JsonArray items = new JsonArray();
-        StringBuilder output = new StringBuilder();
-        int count = 0;
+    private void handleListInventory(String requestId) {
+        try {
+            List<InventoryItemSnapshot> inventory = callOnClientThread(this::readInventorySnapshot);
+            JsonArray items = new JsonArray();
+            StringBuilder output = new StringBuilder();
 
-        for (int slot = 0; slot < player.getInventory().size(); slot++) {
-            ItemStack stack = player.getInventory().getStack(slot);
-            if (stack.isEmpty()) {
-                continue;
+            for (InventoryItemSnapshot item : inventory) {
+                JsonObject jsonItem = new JsonObject();
+                jsonItem.addProperty("id", item.id());
+                jsonItem.addProperty("displayName", item.displayName());
+                jsonItem.addProperty("count", item.count());
+                jsonItem.addProperty("slot", item.slot());
+                items.add(jsonItem);
+
+                output.append("- ")
+                    .append(item.id())
+                    .append(" (")
+                    .append(item.displayName())
+                    .append(", x")
+                    .append(item.count())
+                    .append(") in slot ")
+                    .append(item.slot())
+                    .append('\n');
             }
 
-            Identifier id = Registries.ITEM.getId(stack.getItem());
-            JsonObject item = new JsonObject();
-            item.addProperty("id", id.toString());
-            item.addProperty("displayName", stack.getName().getString());
-            item.addProperty("count", stack.getCount());
-            item.addProperty("slot", slot);
-            items.add(item);
+            if (inventory.isEmpty()) {
+                sendActionResult(requestId, "Inventory is empty", items);
+                return;
+            }
 
-            output.append("- ")
-                .append(id)
-                .append(" (")
-                .append(stack.getName().getString())
-                .append(", x")
-                .append(stack.getCount())
-                .append(") in slot ")
-                .append(slot)
-                .append('\n');
-            count++;
+            sendActionResult(requestId, "Found " + inventory.size() + " items in inventory:\n\n" + output, items);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
         }
-
-        if (count == 0) {
-            sendActionResult(requestId, "Inventory is empty", items);
-            return;
-        }
-
-        sendActionResult(requestId, "Found " + count + " items in inventory:\n\n" + output, items);
     }
 
-    private void handleFindItem(String requestId, ClientPlayerEntity player, JsonObject args) {
+    private void handleFindItem(String requestId, JsonObject args) {
         String query = lower(getAsString(args, "nameOrType"));
         if (query == null || query.isBlank()) {
             sendError(requestId, "nameOrType is required.");
             return;
         }
 
-        for (int slot = 0; slot < player.getInventory().size(); slot++) {
-            ItemStack stack = player.getInventory().getStack(slot);
-            if (stack.isEmpty()) {
-                continue;
-            }
-
-            String id = Registries.ITEM.getId(stack.getItem()).toString();
-            String displayName = stack.getName().getString();
-            if (id.toLowerCase().contains(query) || displayName.toLowerCase().contains(query)) {
+        try {
+            InventoryItemSnapshot item = callOnClientThread(() -> findMatchingInventoryItem(query));
+            if (item != null) {
                 JsonObject data = new JsonObject();
-                data.addProperty("id", id);
-                data.addProperty("displayName", displayName);
-                data.addProperty("count", stack.getCount());
-                data.addProperty("slot", slot);
-                sendActionResult(requestId, "Found " + id + " (" + displayName + ") x" + stack.getCount() + " in slot " + slot, data);
+                data.addProperty("id", item.id());
+                data.addProperty("displayName", item.displayName());
+                data.addProperty("count", item.count());
+                data.addProperty("slot", item.slot());
+                sendActionResult(requestId, "Found " + item.id() + " (" + item.displayName() + ") x" + item.count() + " in slot " + item.slot(), data);
                 return;
             }
-        }
 
-        sendActionResult(requestId, "Couldn't find any item matching '" + query + "' in inventory", new JsonObject());
+            sendActionResult(requestId, "Couldn't find any item matching '" + query + "' in inventory", new JsonObject());
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
     }
 
-    private void handleEquipItem(String requestId, ClientPlayerEntity player, JsonObject args) {
+    private void handleEquipItem(String requestId, JsonObject args) {
         String query = lower(getAsString(args, "itemName"));
         if (query == null || query.isBlank()) {
             sendError(requestId, "itemName is required.");
             return;
         }
 
-        for (int slot = 0; slot < 9; slot++) {
-            ItemStack stack = player.getInventory().getStack(slot);
-            if (stack.isEmpty()) {
-                continue;
-            }
-
-            String id = Registries.ITEM.getId(stack.getItem()).toString();
-            String displayName = stack.getName().getString();
-            if (id.toLowerCase().contains(query) || displayName.toLowerCase().contains(query)) {
-                if (player.networkHandler == null) {
-                    sendError(requestId, "Cannot change hotbar slot right now.");
-                    return;
-                }
-
-                player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(slot));
-                sendActionResult(requestId, "Equipped " + id + " to hand from hotbar slot " + slot, new JsonObject());
-                return;
-            }
+        try {
+            InventoryItemSnapshot equippedItem = callOnClientThread(() -> equipMatchingHotbarItem(query));
+            JsonObject data = new JsonObject();
+            data.addProperty("slot", equippedItem.slot());
+            sendActionResult(requestId, "Equipped " + equippedItem.id() + " to hand from hotbar slot " + equippedItem.slot(), data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
         }
-
-        sendError(requestId, "Could not equip '" + query + "'. Only hotbar items are supported in the MVP bridge.");
     }
 
-    private void handleGetBlockInfo(String requestId, ClientWorld world, JsonObject args) {
+    private void handleGetBlockInfo(String requestId, JsonObject args) {
         Integer x = getAsInt(args, "x");
         Integer y = getAsInt(args, "y");
         Integer z = getAsInt(args, "z");
@@ -266,17 +274,18 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             return;
         }
 
-        BlockPos pos = new BlockPos(x, y, z);
-        BlockState state = world.getBlockState(pos);
-        Identifier id = Registries.BLOCK.getId(state.getBlock());
-
-        JsonObject data = new JsonObject();
-        data.addProperty("id", id.toString());
-        data.addProperty("x", x);
-        data.addProperty("y", y);
-        data.addProperty("z", z);
-        data.addProperty("displayName", state.getBlock().getName().getString());
-        sendActionResult(requestId, "Found " + id + " at position (" + x + ", " + y + ", " + z + ")", data);
+        try {
+            BlockInfoSnapshot block = callOnClientThread(() -> readBlockInfo(new BlockPos(x, y, z)));
+            JsonObject data = new JsonObject();
+            data.addProperty("id", block.id());
+            data.addProperty("x", block.x());
+            data.addProperty("y", block.y());
+            data.addProperty("z", block.z());
+            data.addProperty("displayName", block.displayName());
+            sendActionResult(requestId, "Found " + block.id() + " at position (" + block.x() + ", " + block.y() + ", " + block.z() + ")", data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
     }
 
     private void handleMoveToPosition(String requestId, JsonObject args) {
@@ -387,7 +396,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
     }
 
-    private void handleFindBlock(String requestId, ClientPlayerEntity player, ClientWorld world, JsonObject args) {
+    private void handleFindBlock(String requestId, JsonObject args) {
         String query = lower(getAsString(args, "blockType"));
         int maxDistance = getAsInt(args, "maxDistance") != null ? Objects.requireNonNull(getAsInt(args, "maxDistance")) : 16;
         if (query == null || query.isBlank()) {
@@ -395,70 +404,245 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             return;
         }
 
-        BlockPos origin = BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
-        BlockPos bestPos = null;
-        Identifier bestId = null;
-        double bestDistance = Double.MAX_VALUE;
-
-        for (int dx = -maxDistance; dx <= maxDistance; dx++) {
-            for (int dy = -maxDistance; dy <= maxDistance; dy++) {
-                for (int dz = -maxDistance; dz <= maxDistance; dz++) {
-                    BlockPos candidate = origin.add(dx, dy, dz);
-                    BlockState state = world.getBlockState(candidate);
-                    Identifier id = Registries.BLOCK.getId(state.getBlock());
-                    if (!id.toString().toLowerCase().contains(query)) {
-                        continue;
-                    }
-
-                    double distance = candidate.getSquaredDistance(origin);
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        bestPos = candidate;
-                        bestId = id;
-                    }
-                }
+        try {
+            FindBlockMatch match = findNearestBlockMatch(query, maxDistance);
+            if (match == null) {
+                sendActionResult(requestId, "No " + query + " found within " + maxDistance + " blocks", new JsonObject());
+                return;
             }
-        }
 
-        if (bestPos == null || bestId == null) {
-            sendActionResult(requestId, "No " + query + " found within " + maxDistance + " blocks", new JsonObject());
+            JsonObject data = new JsonObject();
+            data.addProperty("id", match.id());
+            data.addProperty("x", match.position().getX());
+            data.addProperty("y", match.position().getY());
+            data.addProperty("z", match.position().getZ());
+            sendActionResult(
+                requestId,
+                "Found " + match.id() + " at position (" + match.position().getX() + ", " + match.position().getY() + ", " + match.position().getZ() + ")",
+                data
+            );
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
+    }
+
+    private void handlePlaceBlock(String requestId, JsonObject args) {
+        Integer x = getAsInt(args, "x");
+        Integer y = getAsInt(args, "y");
+        Integer z = getAsInt(args, "z");
+        String faceDirection = lower(getAsString(args, "faceDirection"));
+        if (x == null || y == null || z == null) {
+            sendError(requestId, "x, y and z are required.");
             return;
         }
 
-        JsonObject data = new JsonObject();
-        data.addProperty("id", bestId.toString());
-        data.addProperty("x", bestPos.getX());
-        data.addProperty("y", bestPos.getY());
-        data.addProperty("z", bestPos.getZ());
-        sendActionResult(requestId, "Found " + bestId + " at position (" + bestPos.getX() + ", " + bestPos.getY() + ", " + bestPos.getZ() + ")", data);
+        try {
+            PlacementResult result = placeEquippedBlockSync(new BlockPos(x, y, z), faceDirection);
+            JsonObject data = new JsonObject();
+            data.addProperty("placed", result.placed());
+            data.addProperty("x", x);
+            data.addProperty("y", y);
+            data.addProperty("z", z);
+            if (result.face() != null) {
+                data.addProperty("face", result.face());
+            }
+            if (result.reason() != null) {
+                data.addProperty("reason", result.reason());
+            }
+            if (result.blockId() != null) {
+                data.addProperty("block", result.blockId());
+            }
+            sendActionResult(requestId, result.message(), data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
     }
 
-    private void handleDetectGamemode(String requestId, MinecraftClient client) {
-        if (client.interactionManager == null || client.interactionManager.getCurrentGameMode() == null) {
-            sendError(requestId, "Current gamemode is not available.");
+    private void handleListRecipes(String requestId, JsonObject args) {
+        String outputItem = lower(getAsString(args, "outputItem"));
+        try {
+            BridgeRecipeCatalog.StationAccess stationAccess = callOnClientThread(this::readRecipeStationAccessOnClientThread);
+            List<BridgeRecipeCatalog.InventoryItem> inventory = callOnClientThread(this::readRecipeInventoryOnClientThread);
+            List<BridgeRecipeCatalog.RecipeCandidate> recipes = outputItem == null
+                ? RECIPE_CATALOG.listCraftableRecipes(inventory, stationAccess)
+                : RECIPE_CATALOG.findRecipes(outputItem, inventory, stationAccess).stream()
+                    .filter(candidate -> candidate.evaluation().canCraft())
+                    .toList();
+
+            JsonObject data = new JsonObject();
+            JsonArray items = new JsonArray();
+            for (BridgeRecipeCatalog.RecipeCandidate candidate : recipes) {
+                items.add(recipeCandidateToJson(candidate));
+            }
+            data.add("recipes", items);
+            data.addProperty("count", recipes.size());
+            if (outputItem != null) {
+                data.addProperty("outputItem", outputItem);
+            }
+
+            if (recipes.isEmpty()) {
+                sendActionResult(
+                    requestId,
+                    "No craftable recipes found" + (outputItem != null ? " for " + outputItem : "") + " with current inventory",
+                    data
+                );
+                return;
+            }
+
+            StringBuilder output = new StringBuilder("Found " + recipes.size() + " craftable recipe(s):\n\n");
+            for (int index = 0; index < recipes.size(); index++) {
+                BridgeRecipeCatalog.RecipeCandidate candidate = recipes.get(index);
+                output.append(index + 1)
+                    .append(". ")
+                    .append(candidate.recipe().outputItem())
+                    .append(" (x")
+                    .append(candidate.recipe().outputCount())
+                    .append(")\n");
+                output.append("   Ingredients: ")
+                    .append(formatIngredientSummaries(candidate.recipe()))
+                    .append("\n\n");
+            }
+
+            sendActionResult(requestId, output.toString(), data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
+    }
+
+    private void handleGetRecipe(String requestId, JsonObject args) {
+        String itemName = lower(getAsString(args, "itemName"));
+        if (itemName == null || itemName.isBlank()) {
+            sendError(requestId, "itemName is required.");
             return;
         }
 
-        String gameMode = client.interactionManager.getCurrentGameMode().name();
-        JsonObject data = new JsonObject();
-        data.addProperty("gameMode", gameMode);
-        sendActionResult(requestId, "Bot gamemode: \"" + gameMode + "\"", data);
+        try {
+            BridgeRecipeCatalog.StationAccess stationAccess = callOnClientThread(this::readRecipeStationAccessOnClientThread);
+            List<BridgeRecipeCatalog.InventoryItem> inventory = callOnClientThread(this::readRecipeInventoryOnClientThread);
+            List<BridgeRecipeCatalog.RecipeCandidate> recipes = RECIPE_CATALOG.findRecipes(itemName, inventory, stationAccess);
+
+            JsonObject data = new JsonObject();
+            JsonArray items = new JsonArray();
+            for (BridgeRecipeCatalog.RecipeCandidate candidate : recipes) {
+                items.add(recipeCandidateToJson(candidate));
+            }
+            data.add("recipes", items);
+            data.addProperty("count", recipes.size());
+            data.addProperty("itemName", itemName);
+
+            if (recipes.isEmpty()) {
+                sendActionResult(requestId, "No recipes found for " + itemName, data);
+                return;
+            }
+
+            StringBuilder output = new StringBuilder("Recipe(s) for " + itemName + ":\n\n");
+            for (int index = 0; index < recipes.size(); index++) {
+                BridgeRecipeCatalog.RecipeCandidate candidate = recipes.get(index);
+                output.append(index + 1)
+                    .append(". Output: ")
+                    .append(candidate.recipe().outputItem())
+                    .append(" (x")
+                    .append(candidate.recipe().outputCount())
+                    .append(")");
+                output.append(candidate.evaluation().canCraft() ? " [craftable]\n" : " [missing: " + candidate.evaluation().missingTotal() + "]\n");
+                output.append("   Ingredients: ")
+                    .append(formatIngredientSummaries(candidate.recipe()))
+                    .append("\n\n");
+            }
+
+            sendActionResult(requestId, output.toString(), data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
     }
 
-    private void handleSendChat(String requestId, ClientPlayerEntity player, JsonObject args) {
+    private void handleCanCraft(String requestId, JsonObject args) {
+        String itemName = lower(getAsString(args, "itemName"));
+        if (itemName == null || itemName.isBlank()) {
+            sendError(requestId, "itemName is required.");
+            return;
+        }
+
+        try {
+            BridgeRecipeCatalog.StationAccess stationAccess = callOnClientThread(this::readRecipeStationAccessOnClientThread);
+            List<BridgeRecipeCatalog.InventoryItem> inventory = callOnClientThread(this::readRecipeInventoryOnClientThread);
+            List<BridgeRecipeCatalog.RecipeCandidate> recipes = RECIPE_CATALOG.findRecipes(itemName, inventory, stationAccess);
+            JsonObject data = new JsonObject();
+            data.addProperty("itemName", itemName);
+
+            if (recipes.isEmpty()) {
+                data.addProperty("canCraft", false);
+                data.add("missing", new JsonArray());
+                sendActionResult(requestId, "No recipe found for " + itemName, data);
+                return;
+            }
+
+            BridgeRecipeCatalog.RecipeCandidate best = recipes.getFirst();
+            data.addProperty("canCraft", best.evaluation().canCraft());
+            data.addProperty("resultName", best.recipe().outputItem());
+            data.add("missing", missingRequirementsToJson(best.evaluation().missing()));
+            if (best.evaluation().canCraft()) {
+                sendActionResult(requestId, "Yes, can craft " + best.recipe().outputItem() + ". Have all required ingredients.", data);
+                return;
+            }
+
+            sendActionResult(requestId, formatMissingRequirements(best), data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
+    }
+
+    private void handleCraftItem(String requestId, JsonObject args) {
+        String outputItem = lower(getAsString(args, "outputItem"));
+        int amount = getAsInt(args, "amount") != null ? Objects.requireNonNull(getAsInt(args, "amount")) : 1;
+        if (outputItem == null || outputItem.isBlank()) {
+            sendError(requestId, "outputItem is required.");
+            return;
+        }
+        if (amount < 1) {
+            sendError(requestId, "amount must be a positive integer.");
+            return;
+        }
+
+        try {
+            CraftResult result = craftItemSync(outputItem, amount);
+            JsonObject data = new JsonObject();
+            data.addProperty("crafted", result.craftedCount() > 0);
+            data.addProperty("outputItem", result.outputItem());
+            data.addProperty("craftedCount", result.craftedCount());
+            sendActionResult(requestId, "Successfully crafted " + result.outputItem() + " " + result.craftedCount() + " time(s)", data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
+    }
+
+    private void handleDetectGamemode(String requestId) {
+        try {
+            String gameMode = callOnClientThread(this::readCurrentGamemode);
+            JsonObject data = new JsonObject();
+            data.addProperty("gameMode", gameMode);
+            sendActionResult(requestId, "Bot gamemode: \"" + gameMode + "\"", data);
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
+    }
+
+    private void handleSendChat(String requestId, JsonObject args) {
         String message = getAsString(args, "message");
         if (message == null || message.isBlank()) {
             sendError(requestId, "message is required.");
             return;
         }
 
-        if (player.networkHandler == null) {
-            sendError(requestId, "Chat is not available right now.");
-            return;
+        try {
+            callOnClientThread(() -> {
+                sendChatMessage(message);
+                return null;
+            });
+            sendActionResult(requestId, "Sent message: \"" + message + "\"", new JsonObject());
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
         }
-
-        player.networkHandler.sendChatMessage(message);
-        sendActionResult(requestId, "Sent message: \"" + message + "\"", new JsonObject());
     }
 
     private void sendHello() {
@@ -474,7 +658,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             FabricLoader.getInstance().getModContainer("fabricloader")
                 .map(container -> container.getMetadata().getVersion().getFriendlyString())
                 .orElse("unknown"),
-            isWorldReady(),
+            readSessionStateSnapshotSafely().worldReady(),
             SUPPORTED_ACTIONS,
             List.of(
                 "Fabric MVP bridge: read-only registry access plus a small set of player actions.",
@@ -484,14 +668,12 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private void sendSessionState() {
-        MinecraftClient client = MinecraftClient.getInstance();
+        SessionStateSnapshot snapshot = readSessionStateSnapshotSafely();
         send(BridgeProtocolMessages.sessionState(
-            isWorldReady(),
-            client.player != null,
-            client.player != null ? client.player.getName().getString() : null,
-            client.world != null && client.world.getRegistryKey() != null
-                ? client.world.getRegistryKey().getValue().toString()
-                : null
+            snapshot.worldReady(),
+            snapshot.connected(),
+            snapshot.playerName(),
+            snapshot.dimension()
         ));
     }
 
@@ -533,8 +715,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private void monitorWorldState() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        boolean worldReady = client.player != null && client.world != null;
+        boolean worldReady = readSessionStateSnapshotSafely().worldReady();
         if (worldReady != lastWorldReady) {
             lastWorldReady = worldReady;
             broadcastSessionState();
@@ -542,8 +723,957 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private boolean isWorldReady() {
+        return readSessionStateSnapshotSafely().worldReady();
+    }
+
+    private SessionStateSnapshot readSessionStateSnapshotSafely() {
+        try {
+            return readSessionStateSnapshot();
+        } catch (Exception error) {
+            return new SessionStateSnapshot(false, false, null, null);
+        }
+    }
+
+    private SessionStateSnapshot readSessionStateSnapshot() throws Exception {
+        return callOnClientThread(() -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            ClientPlayerEntity player = client.player;
+            ClientWorld world = client.world;
+            String dimension = world != null && world.getRegistryKey() != null
+                ? world.getRegistryKey().getValue().toString()
+                : null;
+            return new SessionStateSnapshot(player != null && world != null, player != null, player != null ? player.getName().getString() : null, dimension);
+        });
+    }
+
+    private PositionSnapshot readPlayerPosition() {
+        ClientPlayerEntity player = requirePlayer();
+        return new PositionSnapshot(
+            (int) Math.floor(player.getX()),
+            (int) Math.floor(player.getY()),
+            (int) Math.floor(player.getZ())
+        );
+    }
+
+    private List<InventoryItemSnapshot> readInventorySnapshot() {
+        ClientPlayerEntity player = requirePlayer();
+        List<InventoryItemSnapshot> items = new ArrayList<>();
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            items.add(new InventoryItemSnapshot(
+                Registries.ITEM.getId(stack.getItem()).toString(),
+                stack.getName().getString(),
+                stack.getCount(),
+                slot
+            ));
+        }
+        return List.copyOf(items);
+    }
+
+    private InventoryItemSnapshot findMatchingInventoryItem(String query) {
+        return findMatchingInventoryItemSnapshot(query);
+    }
+
+    private InventoryItemSnapshot findMatchingInventoryItemSnapshot(String query) {
+        ClientPlayerEntity player = requirePlayer();
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            String id = Registries.ITEM.getId(stack.getItem()).toString();
+            String displayName = stack.getName().getString();
+            if (id.toLowerCase().contains(query) || displayName.toLowerCase().contains(query)) {
+                return new InventoryItemSnapshot(id, displayName, stack.getCount(), slot);
+            }
+        }
+
+        return null;
+    }
+
+    private InventoryItemSnapshot equipMatchingHotbarItem(String query) {
+        try {
+            return equipMatchingInventoryItem(query);
+        } catch (Exception error) {
+            throw new IllegalStateException(error.getMessage(), error);
+        }
+    }
+
+    private InventoryItemSnapshot equipMatchingInventoryItem(String query) throws Exception {
+        ClientPlayerEntity player = requirePlayer();
+        InventoryItemSnapshot match = findMatchingInventoryItemSnapshot(query);
+        if (match == null) {
+            throw new IllegalStateException("Could not equip '" + query + "'. Item not found in inventory.");
+        }
+
+        int hotbarSlot = match.slot() < 9 ? match.slot() : chooseHotbarSlotForSwap(player, match.slot());
+        if (match.slot() != hotbarSlot) {
+            swapInventorySlotIntoHotbar(player, match.slot(), hotbarSlot);
+        }
+
+        selectHotbarSlot(player, hotbarSlot);
+        ItemStack equipped = player.getInventory().getStack(hotbarSlot);
+        return new InventoryItemSnapshot(
+            Registries.ITEM.getId(equipped.getItem()).toString(),
+            equipped.getName().getString(),
+            equipped.getCount(),
+            hotbarSlot
+        );
+    }
+
+    private int chooseHotbarSlotForSwap(ClientPlayerEntity player, int sourceSlot) {
+        int selected = player.getInventory().getSelectedSlot();
+        if (sourceSlot == selected) {
+            return selected;
+        }
+
+        ItemStack selectedStack = player.getInventory().getStack(selected);
+        if (selectedStack.isEmpty()) {
+            return selected;
+        }
+
+        for (int slot = 0; slot < 9; slot++) {
+            if (slot == sourceSlot) {
+                return slot;
+            }
+            if (player.getInventory().getStack(slot).isEmpty()) {
+                return slot;
+            }
+        }
+
+        return selected;
+    }
+
+    private void swapInventorySlotIntoHotbar(ClientPlayerEntity player, int inventorySlot, int hotbarSlot) {
+        if (player.currentScreenHandler != player.playerScreenHandler) {
+            throw new IllegalStateException("Cannot rearrange inventory while another screen is open.");
+        }
+
+        int screenSlot = inventorySlotToPlayerScreenSlot(inventorySlot);
+        if (screenSlot < 0) {
+            throw new IllegalStateException("Inventory slot " + inventorySlot + " cannot be moved to the hotbar in the MVP bridge.");
+        }
+
+        requireInteractionManager().clickSlot(
+            player.playerScreenHandler.syncId,
+            screenSlot,
+            hotbarSlot,
+            SlotActionType.SWAP,
+            player
+        );
+    }
+
+    private void selectHotbarSlot(ClientPlayerEntity player, int hotbarSlot) {
+        if (player.networkHandler == null) {
+            throw new IllegalStateException("Cannot change hotbar slot right now.");
+        }
+
+        player.getInventory().setSelectedSlot(hotbarSlot);
+        player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(hotbarSlot));
+    }
+
+    private int inventorySlotToPlayerScreenSlot(int inventorySlot) {
+        if (inventorySlot >= 9 && inventorySlot <= 35) {
+            return inventorySlot;
+        }
+        if (inventorySlot >= 0 && inventorySlot <= 8) {
+            return PlayerScreenHandler.HOTBAR_START + inventorySlot;
+        }
+        if (inventorySlot == 40) {
+            return PlayerScreenHandler.OFFHAND_ID;
+        }
+        return -1;
+    }
+
+    private List<BridgeRecipeCatalog.InventoryItem> readRecipeInventoryOnClientThread() {
+        List<BridgeRecipeCatalog.InventoryItem> items = new ArrayList<>();
+        for (InventoryItemSnapshot snapshot : readInventorySnapshot()) {
+            items.add(new BridgeRecipeCatalog.InventoryItem(snapshot.id(), snapshot.count()));
+        }
+        return List.copyOf(items);
+    }
+
+    private List<BridgeRecipeCatalog.InventorySlot> readRecipeInventorySlotsOnClientThread() {
+        List<BridgeRecipeCatalog.InventorySlot> items = new ArrayList<>();
+        ClientPlayerEntity player = requirePlayer();
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            items.add(new BridgeRecipeCatalog.InventorySlot(slot, Registries.ITEM.getId(stack.getItem()).toString(), stack.getCount()));
+        }
+        return List.copyOf(items);
+    }
+
+    private BridgeRecipeCatalog.StationAccess readRecipeStationAccessOnClientThread() {
+        boolean nearby = findNearestExactBlockMatchOnClientThread("crafting_table", 16) != null;
+        boolean inInventory = countMatchingInventoryItemsOnClientThread("crafting_table") > 0;
+        return new BridgeRecipeCatalog.StationAccess(nearby, inInventory);
+    }
+
+    private BlockInfoSnapshot readBlockInfo(BlockPos pos) {
+        ClientWorld world = requireWorld();
+        BlockState state = world.getBlockState(pos);
+        Identifier id = Registries.BLOCK.getId(state.getBlock());
+        return new BlockInfoSnapshot(id.toString(), state.getBlock().getName().getString(), pos.getX(), pos.getY(), pos.getZ());
+    }
+
+    private String readCurrentGamemode() {
         MinecraftClient client = MinecraftClient.getInstance();
-        return client.player != null && client.world != null;
+        if (client.interactionManager == null || client.interactionManager.getCurrentGameMode() == null) {
+            throw new IllegalStateException("Current gamemode is not available.");
+        }
+
+        return client.interactionManager.getCurrentGameMode().name();
+    }
+
+    private void sendChatMessage(String message) {
+        ClientPlayerEntity player = requirePlayer();
+        if (player.networkHandler == null) {
+            throw new IllegalStateException("Chat is not available right now.");
+        }
+
+        player.networkHandler.sendChatMessage(message);
+    }
+
+    private FindBlockMatch findNearestBlockMatch(String query, int maxDistance) throws Exception {
+        SearchOrigin origin = callOnClientThread(this::readSearchOrigin);
+        if (origin == null) {
+            return null;
+        }
+
+        BlockBoxBatchCursor cursor = new BlockBoxBatchCursor(origin.position(), -maxDistance, maxDistance, -maxDistance, maxDistance, -maxDistance, maxDistance);
+        FindBlockMatch bestMatch = null;
+
+        while (cursor.hasRemaining()) {
+            List<BlockPos> batch = cursor.nextBatch(SCAN_BATCH_SIZE);
+            FindBlockMatch batchMatch = callOnClientThread(() -> evaluateFindBlockBatch(origin, query, batch));
+            if (batchMatch != null && (bestMatch == null || batchMatch.distanceSq() < bestMatch.distanceSq())) {
+                bestMatch = batchMatch;
+            }
+        }
+
+        return bestMatch;
+    }
+
+    private FindBlockMatch findNearestExactBlockMatchOnClientThread(String targetType, int maxDistance) {
+        SearchOrigin origin = readSearchOrigin();
+        if (origin == null) {
+            return null;
+        }
+
+        ClientWorld world = requireWorld();
+        FindBlockMatch bestMatch = null;
+        int verticalRadius = Math.min(maxDistance, 12);
+        for (int dx = -maxDistance; dx <= maxDistance; dx++) {
+            for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
+                for (int dz = -maxDistance; dz <= maxDistance; dz++) {
+                    BlockPos candidate = origin.position().add(dx, dy, dz);
+                    BlockState state = world.getBlockState(candidate);
+                    String localId = BridgePlacementSupport.localId(Registries.BLOCK.getId(state.getBlock()).toString());
+                    if (!localId.equals(targetType)) {
+                        continue;
+                    }
+
+                    double distanceSq = candidate.getSquaredDistance(origin.position());
+                    if (bestMatch == null || distanceSq < bestMatch.distanceSq()) {
+                        bestMatch = new FindBlockMatch(localId, candidate.toImmutable(), distanceSq);
+                    }
+                }
+            }
+        }
+
+        return bestMatch;
+    }
+
+    private FindBlockMatch evaluateFindBlockBatch(SearchOrigin origin, String query, List<BlockPos> batch) {
+        ClientWorld world = requireWorld();
+        FindBlockMatch bestMatch = null;
+        for (BlockPos candidate : batch) {
+            BlockState state = world.getBlockState(candidate);
+            Identifier id = Registries.BLOCK.getId(state.getBlock());
+            if (!id.toString().toLowerCase().contains(query)) {
+                continue;
+            }
+
+            double distanceSq = candidate.getSquaredDistance(origin.position());
+            if (bestMatch == null || distanceSq < bestMatch.distanceSq()) {
+                bestMatch = new FindBlockMatch(id.toString(), candidate.toImmutable(), distanceSq);
+            }
+        }
+
+        return bestMatch;
+    }
+
+    private int countMatchingLogsInInventoryOnClientThread(String preferredType) {
+        ClientPlayerEntity player = requirePlayer();
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
+            if (matchesHarvestType(itemId, preferredType)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private int countMatchingInventoryItemsOnClientThread(String targetItem) {
+        ClientPlayerEntity player = requirePlayer();
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
+            if (matchesExactBlockType(itemId, targetItem)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private PlacementResult placeEquippedBlockSync(BlockPos targetPos, String faceDirection) throws Exception {
+        PlacementPlan plan = callOnClientThread(() -> buildPlacementPlanOnClientThread(targetPos, faceDirection));
+        if (plan.failure() != null) {
+            return plan.failure();
+        }
+
+        boolean reachedCandidate = false;
+        for (PlacementCandidate candidate : plan.candidates()) {
+            boolean reachable = callOnClientThread(() -> isPlacementCandidateReachableOnClientThread(candidate));
+            if (!reachable) {
+                DigCandidate digCandidate = callOnClientThread(() -> selectBestDigCandidate(findDigCandidates(candidate.supportPos())));
+                if (digCandidate == null) {
+                    continue;
+                }
+                navigationController.moveToPositionSync(digCandidate.standPosition(), Math.max(1.0D, digCandidate.range()), 8000L, true, true);
+                reachable = callOnClientThread(() -> isPlacementCandidateReachableOnClientThread(candidate));
+            }
+
+            if (!reachable) {
+                continue;
+            }
+
+            reachedCandidate = true;
+            PlacementAttempt attempt = callOnClientThread(() -> performPlacementAttemptOnClientThread(targetPos, plan.itemId(), candidate));
+            if (attempt.confirmed()) {
+                return new PlacementResult(
+                    true,
+                    "Placed block at (" + targetPos.getX() + ", " + targetPos.getY() + ", " + targetPos.getZ() + ") using " + attempt.face() + " face",
+                    null,
+                    attempt.face(),
+                    attempt.blockId()
+                );
+            }
+        }
+
+        return new PlacementResult(
+            false,
+            reachedCandidate
+                ? "Failed to place block at (" + targetPos.getX() + ", " + targetPos.getY() + ", " + targetPos.getZ() + "): placement was not confirmed"
+                : "Failed to place block at (" + targetPos.getX() + ", " + targetPos.getY() + ", " + targetPos.getZ() + "): target remained out of reach",
+            reachedCandidate ? "placement_not_confirmed" : "out_of_reach",
+            null,
+            null
+        );
+    }
+
+    private PlacementPlan buildPlacementPlanOnClientThread(BlockPos targetPos, String faceDirection) {
+        ClientPlayerEntity player = requirePlayer();
+        ClientWorld world = requireWorld();
+        ItemStack handStack = player.getMainHandStack();
+        if (handStack.isEmpty() || !(handStack.getItem() instanceof BlockItem)) {
+            return new PlacementPlan(
+                null,
+                List.of(),
+                new PlacementResult(false, "Failed to place block at (" + targetPos.getX() + ", " + targetPos.getY() + ", " + targetPos.getZ() + "): equipped item is not placeable", "not_placeable", null, null)
+            );
+        }
+
+        BlockState targetState = world.getBlockState(targetPos);
+        if (!targetState.isAir() && !targetState.isReplaceable()) {
+            String occupiedBy = Registries.BLOCK.getId(targetState.getBlock()).toString();
+            return new PlacementPlan(
+                Registries.ITEM.getId(handStack.getItem()).toString(),
+                List.of(),
+                new PlacementResult(
+                    false,
+                    "There's already a block (" + occupiedBy + ") at (" + targetPos.getX() + ", " + targetPos.getY() + ", " + targetPos.getZ() + ")",
+                    "occupied",
+                    null,
+                    occupiedBy
+                )
+            );
+        }
+
+        List<PlacementCandidate> candidates = new ArrayList<>();
+        for (String faceLabel : BridgePlacementSupport.orderedFaceDirections(faceDirection)) {
+            Direction supportOffset = directionByName(faceLabel);
+            if (supportOffset == null) {
+                continue;
+            }
+
+            BlockPos supportPos = targetPos.offset(supportOffset);
+            BlockState supportState = world.getBlockState(supportPos);
+            if (supportState.isAir() || supportState.isReplaceable()) {
+                continue;
+            }
+
+            Direction clickedFace = supportOffset.getOpposite();
+            Vec3d aimPoint = Vec3d.ofCenter(supportPos).add(
+                clickedFace.getOffsetX() * 0.499D,
+                clickedFace.getOffsetY() * 0.499D,
+                clickedFace.getOffsetZ() * 0.499D
+            );
+            candidates.add(new PlacementCandidate(faceLabel, supportPos.toImmutable(), clickedFace, aimPoint));
+        }
+
+        if (candidates.isEmpty()) {
+            return new PlacementPlan(
+                Registries.ITEM.getId(handStack.getItem()).toString(),
+                List.of(),
+                new PlacementResult(
+                    false,
+                    "Failed to place block at (" + targetPos.getX() + ", " + targetPos.getY() + ", " + targetPos.getZ() + "): no suitable support block found",
+                    "no_support",
+                    null,
+                    null
+                )
+            );
+        }
+
+        return new PlacementPlan(Registries.ITEM.getId(handStack.getItem()).toString(), List.copyOf(candidates), null);
+    }
+
+    private boolean isPlacementCandidateReachableOnClientThread(PlacementCandidate candidate) {
+        ClientPlayerEntity player = requirePlayer();
+        ClientWorld world = requireWorld();
+        double reach = getInteractionReach(player);
+        if (player.getEyePos().squaredDistanceTo(candidate.aimPoint()) > reach * reach) {
+            return false;
+        }
+        return hasLineOfSightToBlock(world, player.getEyePos(), candidate.aimPoint(), candidate.supportPos());
+    }
+
+    private PlacementAttempt performPlacementAttemptOnClientThread(BlockPos targetPos, String itemId, PlacementCandidate candidate) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientPlayerEntity player = requirePlayer();
+        ClientWorld world = requireWorld();
+        if (client.interactionManager == null) {
+            throw new IllegalStateException("Block interaction is not available right now.");
+        }
+
+        lookAt(player, candidate.aimPoint());
+        ActionResult actionResult = client.interactionManager.interactBlock(
+            player,
+            Hand.MAIN_HAND,
+            new BlockHitResult(candidate.aimPoint(), candidate.clickedFace(), candidate.supportPos(), false)
+        );
+        player.swingHand(Hand.MAIN_HAND);
+
+        BlockState placedState = world.getBlockState(targetPos);
+        String placedBlockId = Registries.BLOCK.getId(placedState.getBlock()).toString();
+        boolean confirmed = !placedState.isAir() && actionResult.isAccepted() && BridgePlacementSupport.placementConfirmed(itemId, placedBlockId);
+        return new PlacementAttempt(candidate.faceLabel(), confirmed, placedBlockId);
+    }
+
+    private CraftResult craftItemSync(String outputItem, int amount) throws Exception {
+        int craftedCount = 0;
+
+        for (int attempt = 0; attempt < amount; attempt++) {
+            BridgeRecipeCatalog.RecipeCandidate recipeCandidate = callOnClientThread(() -> {
+                BridgeRecipeCatalog.StationAccess stationAccess = readRecipeStationAccessOnClientThread();
+                List<BridgeRecipeCatalog.InventoryItem> inventory = readRecipeInventoryOnClientThread();
+                return RECIPE_CATALOG.selectRecipe(outputItem, inventory, stationAccess);
+            });
+
+            if (recipeCandidate == null) {
+                throw new IllegalStateException("Recipe '" + outputItem + "' is not supported by the Fabric MVP crafting bridge.");
+            }
+
+            if (!recipeCandidate.evaluation().canCraft()) {
+                if (craftedCount > 0) {
+                    break;
+                }
+                throw new IllegalStateException(formatMissingRequirements(recipeCandidate));
+            }
+
+            Map<String, Integer> before = callOnClientThread(this::readInventoryCountMapOnClientThread);
+            if (recipeCandidate.recipe().requiresCraftingTable()) {
+                BlockPos tablePos = ensureCraftingTableAvailableSync();
+                CraftingScreenHandler handler = openCraftingTableScreenSync(tablePos);
+                try {
+                    craftRecipeOnceSync(handler, recipeCandidate.recipe());
+                } finally {
+                    closeHandledScreenSync();
+                }
+            } else {
+                PlayerScreenHandler handler = callOnClientThread(() -> requirePlayer().playerScreenHandler);
+                craftRecipeOnceSync(handler, recipeCandidate.recipe());
+            }
+
+            Map<String, Integer> after = callOnClientThread(this::readInventoryCountMapOnClientThread);
+            int delta = after.getOrDefault(recipeCandidate.recipe().outputItem(), 0) - before.getOrDefault(recipeCandidate.recipe().outputItem(), 0);
+            if (delta < recipeCandidate.recipe().outputCount()) {
+                throw new IllegalStateException("Crafting " + recipeCandidate.recipe().outputItem() + " did not produce the expected output.");
+            }
+            craftedCount++;
+        }
+
+        if (craftedCount == 0) {
+            throw new IllegalStateException("Failed to craft " + outputItem + ": missing ingredients or recipe not found");
+        }
+
+        return new CraftResult(outputItem, craftedCount);
+    }
+
+    private BlockPos ensureCraftingTableAvailableSync() throws Exception {
+        FindBlockMatch nearby = callOnClientThread(() -> findNearestExactBlockMatchOnClientThread("crafting_table", 16));
+        if (nearby != null) {
+            return nearby.position();
+        }
+
+        callOnClientThread(() -> {
+            equipMatchingInventoryItem("crafting_table");
+            return null;
+        });
+        BlockPos targetPos = callOnClientThread(this::findPlacementTargetNearPlayerOnClientThread);
+        if (targetPos == null) {
+            throw new IllegalStateException("Could not find a nearby valid spot to place the crafting_table.");
+        }
+
+        PlacementResult result = placeEquippedBlockSync(targetPos, null);
+        if (!result.placed()) {
+            throw new IllegalStateException(result.message());
+        }
+        return targetPos;
+    }
+
+    private BlockPos findPlacementTargetNearPlayerOnClientThread() {
+        ClientPlayerEntity player = requirePlayer();
+        ClientWorld world = requireWorld();
+        BlockPos origin = BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
+        BlockPos playerFeet = currentPlayerBlockPosOnClientThread();
+        BlockPos playerHead = playerFeet.up();
+        int[] verticalOffsets = new int[] {0, 1, -1};
+
+        for (int radius = 1; radius <= 2; radius++) {
+            for (int dy : verticalOffsets) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.abs(dx) != radius && Math.abs(dz) != radius) {
+                            continue;
+                        }
+                        BlockPos candidate = origin.add(dx, dy, dz);
+                        if (candidate.equals(playerFeet) || candidate.equals(playerHead)) {
+                            continue;
+                        }
+
+                        BlockState state = world.getBlockState(candidate);
+                        if (!state.isAir() && !state.isReplaceable()) {
+                            continue;
+                        }
+                        if (!isSolidGround(world, candidate.down())) {
+                            continue;
+                        }
+
+                        PlacementPlan plan = buildPlacementPlanOnClientThread(candidate, null);
+                        if (plan.failure() == null && canReachOrRepositionForPlacementOnClientThread(candidate, plan)) {
+                            return candidate.toImmutable();
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private boolean canReachOrRepositionForPlacementOnClientThread(BlockPos targetPos, PlacementPlan plan) {
+        for (PlacementCandidate candidate : plan.candidates()) {
+            if (isPlacementCandidateReachableOnClientThread(candidate)) {
+                return true;
+            }
+            if (selectBestDigCandidate(findDigCandidates(candidate.supportPos())) != null) {
+                return true;
+            }
+        }
+
+        return selectBestDigCandidate(findDigCandidates(targetPos)) != null;
+    }
+
+    private CraftingScreenHandler openCraftingTableScreenSync(BlockPos tablePos) throws Exception {
+        ReachabilityResult reachability = callOnClientThread(() -> isBlockReachableNow(tablePos));
+        if (!reachability.reachable()) {
+            DigCandidate candidate = callOnClientThread(() -> selectBestDigCandidate(findDigCandidates(tablePos)));
+            if (candidate == null) {
+                throw new IllegalStateException("Could not find a valid position to use the crafting_table at (" + tablePos.getX() + ", " + tablePos.getY() + ", " + tablePos.getZ() + ")");
+            }
+            navigationController.moveToPositionSync(candidate.standPosition(), Math.max(1.0D, candidate.range()), 8000L, true, true);
+        }
+
+        callOnClientThread(() -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            ClientPlayerEntity player = requirePlayer();
+            ReachabilityResult currentReachability = isBlockReachableNow(tablePos);
+            if (!currentReachability.reachable()) {
+                throw new IllegalStateException("Crafting table is still out of reach.");
+            }
+            lookAt(player, currentReachability.aimPoint());
+            ActionResult result = requireInteractionManager().interactBlock(
+                player,
+                Hand.MAIN_HAND,
+                new BlockHitResult(currentReachability.aimPoint(), currentReachability.face(), tablePos, false)
+            );
+            if (!result.isAccepted()) {
+                throw new IllegalStateException("Could not open the crafting_table screen.");
+            }
+            return client.player.currentScreenHandler;
+        });
+
+        long deadline = System.currentTimeMillis() + 1500L;
+        while (System.currentTimeMillis() < deadline) {
+            ScreenHandler handler = callOnClientThread(() -> requirePlayer().currentScreenHandler);
+            if (handler instanceof CraftingScreenHandler craftingScreenHandler) {
+                return craftingScreenHandler;
+            }
+            Thread.sleep(50L);
+        }
+
+        throw new IllegalStateException("Timed out while waiting for the crafting_table screen to open.");
+    }
+
+    private void closeHandledScreenSync() throws Exception {
+        callOnClientThread(() -> {
+            ClientPlayerEntity player = requirePlayer();
+            if (player.currentScreenHandler != player.playerScreenHandler) {
+                player.closeHandledScreen();
+            }
+            return null;
+        });
+
+        long deadline = System.currentTimeMillis() + 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            boolean closed = callOnClientThread(() -> {
+                ClientPlayerEntity player = requirePlayer();
+                return player.currentScreenHandler == player.playerScreenHandler;
+            });
+            if (closed) {
+                return;
+            }
+            Thread.sleep(25L);
+        }
+    }
+
+    private void craftRecipeOnceSync(ScreenHandler handler, BridgeRecipeCatalog.RecipeDefinition recipe) throws Exception {
+        callOnClientThread(() -> {
+            clearCraftingSlotsOnClientThread(handler);
+            if (!canAcceptCraftOutputOnClientThread(recipe.outputItem(), recipe.outputCount())) {
+                throw new IllegalStateException("Not enough inventory space to receive crafted output for " + recipe.outputItem() + ".");
+            }
+
+            List<BridgeRecipeCatalog.InventorySlot> inventorySlots = readRecipeInventorySlotsOnClientThread();
+            BridgeRecipeCatalog.GridAssignment assignment = recipe.resolveGridAssignment(inventorySlots);
+            if (assignment == null) {
+                throw new IllegalStateException("Missing ingredients for " + recipe.outputItem() + ".");
+            }
+            if (!handler.getCursorStack().isEmpty()) {
+                throw new IllegalStateException("Cannot craft while holding an item on the cursor.");
+            }
+
+            for (BridgeRecipeCatalog.AssignedPatternSlot slot : assignment.assignments()) {
+                int sourceScreenSlot = findScreenSlotIdForInventorySlot(handler, slot.inventorySlot());
+                int inputScreenSlot = getCraftingInputSlots(handler).get(slot.gridIndex()).id;
+                placeSingleItemIntoCraftingSlotOnClientThread(handler, sourceScreenSlot, inputScreenSlot);
+            }
+            return null;
+        });
+
+        waitForCraftResultSync(handler, recipe.outputItem(), recipe.outputCount());
+
+        callOnClientThread(() -> {
+            Slot resultSlot = getCraftingOutputSlot(handler);
+            requireInteractionManager().clickSlot(handler.syncId, resultSlot.id, 0, SlotActionType.QUICK_MOVE, requirePlayer());
+            return null;
+        });
+    }
+
+    private void clearCraftingSlotsOnClientThread(ScreenHandler handler) {
+        ClientPlayerEntity player = requirePlayer();
+        for (Slot inputSlot : getCraftingInputSlots(handler)) {
+            if (inputSlot.hasStack()) {
+                requireInteractionManager().clickSlot(handler.syncId, inputSlot.id, 0, SlotActionType.QUICK_MOVE, player);
+            }
+        }
+        Slot resultSlot = getCraftingOutputSlot(handler);
+        if (resultSlot.hasStack()) {
+            requireInteractionManager().clickSlot(handler.syncId, resultSlot.id, 0, SlotActionType.QUICK_MOVE, player);
+        }
+    }
+
+    private void placeSingleItemIntoCraftingSlotOnClientThread(ScreenHandler handler, int sourceScreenSlot, int targetScreenSlot) {
+        ClientPlayerEntity player = requirePlayer();
+        requireInteractionManager().clickSlot(handler.syncId, sourceScreenSlot, 0, SlotActionType.PICKUP, player);
+        requireInteractionManager().clickSlot(handler.syncId, targetScreenSlot, 1, SlotActionType.PICKUP, player);
+        if (!handler.getCursorStack().isEmpty()) {
+            requireInteractionManager().clickSlot(handler.syncId, sourceScreenSlot, 0, SlotActionType.PICKUP, player);
+        }
+        if (!handler.getCursorStack().isEmpty()) {
+            throw new IllegalStateException("Failed to restore the cursor stack after filling the crafting grid.");
+        }
+    }
+
+    private void waitForCraftResultSync(ScreenHandler handler, String outputItem, int outputCount) throws Exception {
+        long deadline = System.currentTimeMillis() + 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            boolean ready = callOnClientThread(() -> {
+                Slot resultSlot = getCraftingOutputSlot(handler);
+                if (!resultSlot.hasStack()) {
+                    return false;
+                }
+                ItemStack stack = resultSlot.getStack();
+                String itemId = BridgeRecipeCatalog.normalize(Registries.ITEM.getId(stack.getItem()).toString());
+                return Objects.equals(itemId, outputItem) && stack.getCount() >= outputCount;
+            });
+            if (ready) {
+                return;
+            }
+            Thread.sleep(25L);
+        }
+
+        throw new IllegalStateException("Craft result for " + outputItem + " did not appear in time.");
+    }
+
+    private boolean canAcceptCraftOutputOnClientThread(String outputItem, int outputCount) {
+        ClientPlayerEntity player = requirePlayer();
+        int remaining = outputCount;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                return true;
+            }
+
+            String itemId = BridgeRecipeCatalog.normalize(Registries.ITEM.getId(stack.getItem()).toString());
+            if (Objects.equals(itemId, outputItem)) {
+                remaining -= Math.max(0, stack.getMaxCount() - stack.getCount());
+                if (remaining <= 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private int findScreenSlotIdForInventorySlot(ScreenHandler handler, int inventorySlot) {
+        ClientPlayerEntity player = requirePlayer();
+        for (Slot slot : handler.slots) {
+            if (slot.inventory == player.getInventory() && slot.getIndex() == inventorySlot) {
+                return slot.id;
+            }
+        }
+        throw new IllegalStateException("Could not resolve screen slot for inventory slot " + inventorySlot + ".");
+    }
+
+    private List<Slot> getCraftingInputSlots(ScreenHandler handler) {
+        if (handler instanceof PlayerScreenHandler playerScreenHandler) {
+            return playerScreenHandler.getInputSlots();
+        }
+        if (handler instanceof CraftingScreenHandler craftingScreenHandler) {
+            return craftingScreenHandler.getInputSlots();
+        }
+        throw new IllegalStateException("Current screen is not a crafting screen.");
+    }
+
+    private Slot getCraftingOutputSlot(ScreenHandler handler) {
+        if (handler instanceof PlayerScreenHandler playerScreenHandler) {
+            return playerScreenHandler.getOutputSlot();
+        }
+        if (handler instanceof CraftingScreenHandler craftingScreenHandler) {
+            return craftingScreenHandler.getOutputSlot();
+        }
+        throw new IllegalStateException("Current screen is not a crafting screen.");
+    }
+
+    private Map<String, Integer> readInventoryCountMapOnClientThread() {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (InventoryItemSnapshot item : readInventorySnapshot()) {
+            counts.merge(BridgeRecipeCatalog.normalize(item.id()), item.count(), Integer::sum);
+        }
+        return counts;
+    }
+
+    private TaskServices.HarvestTarget findNearestHarvestTargetBatched(String preferredType, int maxRadius, Set<BlockPos> ignoredTargets) throws Exception {
+        SearchOrigin origin = callOnClientThread(this::readSearchOrigin);
+        if (origin == null) {
+            return null;
+        }
+
+        int verticalRadius = Math.min(12, maxRadius);
+        BlockBoxBatchCursor cursor = new BlockBoxBatchCursor(origin.position(), -maxRadius, maxRadius, -verticalRadius, verticalRadius, -maxRadius, maxRadius);
+        ScoredHarvestTarget bestTarget = null;
+
+        while (cursor.hasRemaining()) {
+            List<BlockPos> batch = cursor.nextBatch(SCAN_BATCH_SIZE);
+            ScoredHarvestTarget batchTarget = callOnClientThread(() -> evaluateHarvestBatch(origin, preferredType, ignoredTargets, batch));
+            if (batchTarget != null && (bestTarget == null || batchTarget.score() < bestTarget.score())) {
+                bestTarget = batchTarget;
+            }
+        }
+
+        return bestTarget == null ? null : bestTarget.target();
+    }
+
+    private ScoredHarvestTarget evaluateHarvestBatch(SearchOrigin origin, String preferredType, Set<BlockPos> ignoredTargets, List<BlockPos> batch) {
+        ClientWorld world = requireWorld();
+        ScoredHarvestTarget bestTarget = null;
+
+        for (BlockPos candidate : batch) {
+            if (ignoredTargets.contains(candidate)) {
+                continue;
+            }
+
+            BlockState state = world.getBlockState(candidate);
+            Identifier id = Registries.BLOCK.getId(state.getBlock());
+            if (!matchesHarvestType(id.toString(), preferredType)) {
+                continue;
+            }
+
+            boolean reachableNow = isBlockReachableNow(candidate).reachable();
+            boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
+            if (!reachableNow && !canReposition) {
+                continue;
+            }
+
+            double horizontalDistance = Math.pow(candidate.getX() - origin.position().getX(), 2) + Math.pow(candidate.getZ() - origin.position().getZ(), 2);
+            double verticalPenalty = Math.max(0, candidate.getY() - origin.position().getY()) * 5.0D + Math.abs(candidate.getY() - origin.position().getY()) * 1.5D;
+            double score = horizontalDistance + verticalPenalty;
+            if (bestTarget == null || score < bestTarget.score()) {
+                bestTarget = new ScoredHarvestTarget(new TaskServices.HarvestTarget(candidate.toImmutable(), id.toString()), score);
+            }
+        }
+
+        return bestTarget;
+    }
+
+    private TaskServices.MineTarget findNearestMineTargetBatched(Set<String> blockTypes, int maxRadius, Set<BlockPos> ignoredTargets) throws Exception {
+        SearchOrigin origin = callOnClientThread(this::readSearchOrigin);
+        if (origin == null) {
+            return null;
+        }
+
+        int verticalRadius = Math.min(16, maxRadius);
+        BlockBoxBatchCursor cursor = new BlockBoxBatchCursor(origin.position(), -maxRadius, maxRadius, -verticalRadius, verticalRadius, -maxRadius, maxRadius);
+        ScoredMineTarget bestTarget = null;
+
+        while (cursor.hasRemaining()) {
+            List<BlockPos> batch = cursor.nextBatch(SCAN_BATCH_SIZE);
+            ScoredMineTarget batchTarget = callOnClientThread(() -> evaluateMineBatch(origin, blockTypes, ignoredTargets, batch));
+            if (batchTarget != null && (bestTarget == null || batchTarget.score() < bestTarget.score())) {
+                bestTarget = batchTarget;
+            }
+        }
+
+        return bestTarget == null ? null : bestTarget.target();
+    }
+
+    private ScoredMineTarget evaluateMineBatch(SearchOrigin origin, Set<String> blockTypes, Set<BlockPos> ignoredTargets, List<BlockPos> batch) {
+        ClientWorld world = requireWorld();
+        ScoredMineTarget bestTarget = null;
+
+        for (BlockPos candidate : batch) {
+            if (ignoredTargets.contains(candidate)) {
+                continue;
+            }
+
+            BlockState state = world.getBlockState(candidate);
+            Identifier id = Registries.BLOCK.getId(state.getBlock());
+            if (!matchesAnyExactBlockType(id.toString(), blockTypes)) {
+                continue;
+            }
+
+            boolean reachableNow = isBlockReachableNow(candidate).reachable();
+            boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
+            boolean obstruction = !reachableNow && !canReposition && findClearableDigObstruction(candidate) != null;
+            if (!reachableNow && !canReposition && !obstruction) {
+                continue;
+            }
+
+            double horizontalDistance = Math.pow(candidate.getX() - origin.position().getX(), 2) + Math.pow(candidate.getZ() - origin.position().getZ(), 2);
+            double verticalPenalty = Math.max(0, candidate.getY() - origin.position().getY()) * 6.0D + Math.abs(candidate.getY() - origin.position().getY()) * 2.0D;
+            double obstructionPenalty = obstruction ? 3.0D : 0.0D;
+            double score = horizontalDistance + verticalPenalty + obstructionPenalty;
+            if (bestTarget == null || score < bestTarget.score()) {
+                bestTarget = new ScoredMineTarget(new TaskServices.MineTarget(candidate.toImmutable(), id.toString()), score);
+            }
+        }
+
+        return bestTarget;
+    }
+
+    private SearchOrigin readSearchOrigin() {
+        ClientPlayerEntity player = requirePlayer();
+        return new SearchOrigin(BlockPos.ofFloored(player.getX(), player.getY(), player.getZ()));
+    }
+
+    private BlockPos currentPlayerBlockPosOnClientThread() {
+        ClientPlayerEntity player = requirePlayer();
+        return BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
+    }
+
+    private ClientPlayerEntity requirePlayer() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) {
+            throw new IllegalStateException("Minecraft player is not ready yet.");
+        }
+        return client.player;
+    }
+
+    private ClientWorld requireWorld() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null) {
+            throw new IllegalStateException("Minecraft world is not ready yet.");
+        }
+        return client.world;
+    }
+
+    private boolean matchesHarvestType(String id, String preferredType) {
+        String normalized = id.toLowerCase();
+        int separatorIndex = normalized.indexOf(':');
+        String localId = separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
+        if (preferredType != null) {
+            return localId.equals(preferredType);
+        }
+
+        return localId.endsWith("_log");
+    }
+
+    private boolean matchesExactBlockType(String id, String targetType) {
+        String normalized = id.toLowerCase();
+        int separatorIndex = normalized.indexOf(':');
+        String localId = separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
+        return localId.equals(targetType.toLowerCase());
+    }
+
+    private boolean matchesAnyExactBlockType(String id, Set<String> targetTypes) {
+        for (String targetType : targetTypes) {
+            if (matchesExactBlockType(id, targetType)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String digBlockSync(BlockPos pos) throws Exception {
@@ -880,9 +2010,79 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private static String localBlockId(String id) {
-        String normalized = id.toLowerCase();
-        int separatorIndex = normalized.indexOf(':');
-        return separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
+        return BridgePlacementSupport.localId(id);
+    }
+
+    private Direction directionByName(String name) {
+        if (name == null) {
+            return null;
+        }
+        return switch (name) {
+            case "down" -> Direction.DOWN;
+            case "up" -> Direction.UP;
+            case "north" -> Direction.NORTH;
+            case "south" -> Direction.SOUTH;
+            case "east" -> Direction.EAST;
+            case "west" -> Direction.WEST;
+            default -> null;
+        };
+    }
+
+    private JsonObject recipeCandidateToJson(BridgeRecipeCatalog.RecipeCandidate candidate) {
+        JsonObject recipe = new JsonObject();
+        recipe.addProperty("result", candidate.recipe().outputItem());
+        recipe.addProperty("resultCount", candidate.recipe().outputCount());
+        recipe.addProperty("requiresCraftingTable", candidate.recipe().requiresCraftingTable());
+        recipe.addProperty("canCraft", candidate.evaluation().canCraft());
+        recipe.addProperty("missingTotal", candidate.evaluation().missingTotal());
+        recipe.add("ingredients", ingredientSummariesToJson(candidate.recipe()));
+        recipe.add("missing", missingRequirementsToJson(candidate.evaluation().missing()));
+        return recipe;
+    }
+
+    private JsonArray ingredientSummariesToJson(BridgeRecipeCatalog.RecipeDefinition recipe) {
+        JsonArray ingredients = new JsonArray();
+        for (BridgeRecipeCatalog.IngredientSummary ingredient : recipe.summarizeIngredients()) {
+            JsonObject jsonIngredient = new JsonObject();
+            jsonIngredient.addProperty("name", ingredient.displayName());
+            jsonIngredient.addProperty("count", ingredient.count());
+            ingredients.add(jsonIngredient);
+        }
+        return ingredients;
+    }
+
+    private JsonArray missingRequirementsToJson(List<BridgeRecipeCatalog.MissingRequirement> missingRequirements) {
+        JsonArray missing = new JsonArray();
+        for (BridgeRecipeCatalog.MissingRequirement requirement : missingRequirements) {
+            JsonObject jsonRequirement = new JsonObject();
+            jsonRequirement.addProperty("name", requirement.name());
+            jsonRequirement.addProperty("count", requirement.count());
+            missing.add(jsonRequirement);
+        }
+        return missing;
+    }
+
+    private String formatIngredientSummaries(BridgeRecipeCatalog.RecipeDefinition recipe) {
+        return recipe.summarizeIngredients().stream()
+            .map(ingredient -> ingredient.displayName() + " x" + ingredient.count())
+            .reduce((left, right) -> left + ", " + right)
+            .orElse("(none)");
+    }
+
+    private String formatMissingRequirements(BridgeRecipeCatalog.RecipeCandidate candidate) {
+        StringBuilder output = new StringBuilder("Cannot craft " + candidate.recipe().outputItem() + ". Missing:\n");
+        for (BridgeRecipeCatalog.MissingRequirement requirement : candidate.evaluation().missing()) {
+            output.append("- ").append(requirement.name()).append(" x").append(requirement.count()).append('\n');
+        }
+        return output.toString().trim();
+    }
+
+    private net.minecraft.client.network.ClientPlayerInteractionManager requireInteractionManager() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.interactionManager == null) {
+            throw new IllegalStateException("Minecraft interaction manager is not ready yet.");
+        }
+        return client.interactionManager;
     }
 
     private record DigTickResult(boolean blockPresent, boolean needsReposition) {
@@ -895,6 +2095,45 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         private static ReachabilityResult unreachable(String reason) {
             return new ReachabilityResult(false, Direction.UP, Vec3d.ZERO, Double.MAX_VALUE, reason);
         }
+    }
+
+    private record PositionSnapshot(int x, int y, int z) {
+    }
+
+    private record InventoryItemSnapshot(String id, String displayName, int count, int slot) {
+    }
+
+    private record BlockInfoSnapshot(String id, String displayName, int x, int y, int z) {
+    }
+
+    private record SessionStateSnapshot(boolean worldReady, boolean connected, String playerName, String dimension) {
+    }
+
+    private record SearchOrigin(BlockPos position) {
+    }
+
+    private record FindBlockMatch(String id, BlockPos position, double distanceSq) {
+    }
+
+    private record ScoredHarvestTarget(TaskServices.HarvestTarget target, double score) {
+    }
+
+    private record ScoredMineTarget(TaskServices.MineTarget target, double score) {
+    }
+
+    private record PlacementPlan(String itemId, List<PlacementCandidate> candidates, PlacementResult failure) {
+    }
+
+    private record PlacementCandidate(String faceLabel, BlockPos supportPos, Direction clickedFace, Vec3d aimPoint) {
+    }
+
+    private record PlacementAttempt(String face, boolean confirmed, String blockId) {
+    }
+
+    private record PlacementResult(boolean placed, String message, String reason, String face, String blockId) {
+    }
+
+    private record CraftResult(String outputItem, int craftedCount) {
     }
 
     private final class BridgeTransportListener implements BridgeServer.Listener {
@@ -979,18 +2218,28 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         @Override
-        public boolean isDigReachable(BlockPos pos) {
-            return isBlockReachableNow(pos).reachable();
+        public int countMatchingLogsInInventory(String preferredType) throws Exception {
+            return callOnClientThread(() -> countMatchingLogsInInventoryOnClientThread(preferredType));
         }
 
         @Override
-        public boolean canRepositionForDig(BlockPos pos) {
-            return selectBestDigCandidate(findDigCandidates(pos)) != null;
+        public int countMatchingInventoryItems(String targetItem) throws Exception {
+            return callOnClientThread(() -> countMatchingInventoryItemsOnClientThread(targetItem));
         }
 
         @Override
-        public boolean hasClearableDigObstruction(BlockPos pos) {
-            return findClearableDigObstruction(pos) != null;
+        public TaskServices.HarvestTarget findNearestHarvestTarget(String preferredType, int maxRadius, Set<BlockPos> ignoredTargets) throws Exception {
+            return findNearestHarvestTargetBatched(preferredType, maxRadius, ignoredTargets);
+        }
+
+        @Override
+        public TaskServices.MineTarget findNearestMineTarget(Set<String> blockTypes, int maxRadius, Set<BlockPos> ignoredTargets) throws Exception {
+            return findNearestMineTargetBatched(blockTypes, maxRadius, ignoredTargets);
+        }
+
+        @Override
+        public BlockPos currentPlayerBlockPos() throws Exception {
+            return callOnClientThread(MinecraftMcpBridgeMod.this::currentPlayerBlockPosOnClientThread);
         }
 
         @Override

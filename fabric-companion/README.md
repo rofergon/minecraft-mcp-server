@@ -26,6 +26,11 @@ The mod currently supports these actions end-to-end:
 - `mine-cobblestone`
 - `get-block-info`
 - `find-block`
+- `place-block`
+- `list-recipes`
+- `get-recipe`
+- `can-craft`
+- `craft-item`
 - `detect-gamemode`
 - `send-chat`
 
@@ -35,6 +40,13 @@ The mod currently supports these actions end-to-end:
 
 `mine-cobblestone` follows the same pattern for short-range automated mining.
 
+The Fabric bridge now also includes a first crafting loop for early-game progression:
+
+- `place-block` can place utility blocks such as `crafting_table`
+- `list-recipes`, `get-recipe`, and `can-craft` report the whitelist recipes currently supported by the bridge
+- `craft-item` supports 2x2 and 3x3 crafting for the current MVP recipe catalog
+- 3x3 crafting first looks for a nearby `crafting_table` before trying to place one from inventory
+
 Current behavior:
 
 - Searches nearby logs, optionally filtered by type such as `oak_log`
@@ -43,6 +55,8 @@ Current behavior:
 - Clears obstructing leaves in front of the player when they block access to the trunk
 - Sends periodic progress updates through `chat_event`
 - Mines nearby `stone` or `cobblestone`, counts collected `cobblestone`, and can clear soft obstructions such as dirt or leaves when they block access
+- Crafts `planks`, `sticks`, `crafting_table`, and basic tool recipes currently included in the Fabric recipe catalog
+- Verifies crafting results against the real inventory after each craft attempt
 
 This keeps long harvesting runs inside the mod so the MCP agent does not need to spend tokens micromanaging every single block.
 
@@ -126,6 +140,7 @@ Relevant backend files in this repository:
 
 ## Limitations
 
-- Not every passthrough tool declared on the MCP side is implemented in the Fabric mod yet.
+- `smelt-item` is still declared on the MCP side but not implemented in the Fabric mod yet.
 - The current navigation is intentionally short-range and task-focused; it is not global pathfinding like Baritone.
 - `harvest-wood` is implemented; other higher-level jobs such as vein mining or excavation are still future work.
+- The fallback path that auto-places a `crafting_table` when no nearby table exists has been improved and is still under live validation after the latest fix.

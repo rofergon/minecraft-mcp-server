@@ -18,6 +18,8 @@ dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.minecraft_version}+build.4:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    testImplementation platform("org.junit:junit-bom:5.11.4")
+    testImplementation "org.junit.jupiter:junit-jupiter"
 }
 
 processResources {
@@ -42,4 +44,8 @@ jar {
     from("../LICENSE") {
         rename { "${it}_${project.base.archivesName.get()}" }
     }
+}
+
+test {
+    useJUnitPlatform()
 }

@@ -17,23 +17,32 @@ final class ActionCoordinator {
         void onFailure(Exception error);
     }
 
+    private final ExecutorService readExecutor;
     private final ExecutorService exclusiveExecutor;
 
     ActionCoordinator() {
-        this(Executors.newSingleThreadExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "minecraft-mcp-action-coordinator");
-            thread.setDaemon(true);
-            return thread;
-        }));
+        this(
+            Executors.newFixedThreadPool(2, runnable -> {
+                Thread thread = new Thread(runnable, "minecraft-mcp-read-coordinator");
+                thread.setDaemon(true);
+                return thread;
+            }),
+            Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "minecraft-mcp-action-coordinator");
+                thread.setDaemon(true);
+                return thread;
+            })
+        );
     }
 
-    ActionCoordinator(ExecutorService exclusiveExecutor) {
+    ActionCoordinator(ExecutorService readExecutor, ExecutorService exclusiveExecutor) {
+        this.readExecutor = readExecutor;
         this.exclusiveExecutor = exclusiveExecutor;
     }
 
     void dispatch(Mode mode, ActionTask task, FailureHandler failureHandler) {
         if (mode == Mode.READ_ONLY) {
-            runSafely(task, failureHandler);
+            readExecutor.submit(() -> runSafely(task, failureHandler));
             return;
         }
 
