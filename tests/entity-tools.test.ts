@@ -61,6 +61,8 @@ test('find-entity returns entity when found', async (t) => {
   t.true(result.content[0].text.includes('5'));
   t.true(result.content[0].text.includes('64'));
   t.true(result.content[0].text.includes('8'));
+  t.is(result.structuredContent.found, true);
+  t.is(result.structuredContent.entity.name, 'zombie');
 });
 
 test('find-entity returns not found when entity too far', async (t) => {
@@ -94,6 +96,7 @@ test('find-entity returns not found when entity too far', async (t) => {
   const result = await executor({ type: 'zombie', maxDistance: 16 });
 
   t.true(result.content[0].text.includes('No zombie found within 16 blocks'));
+  t.is(result.structuredContent.found, false);
 });
 
 test('find-entity returns not found when no entity exists', async (t) => {

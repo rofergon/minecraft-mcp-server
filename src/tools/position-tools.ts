@@ -21,7 +21,7 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
         y: Math.floor(position.y),
         z: Math.floor(position.z)
       };
-      return factory.createResponse(`Current position: (${pos.x}, ${pos.y}, ${pos.z})`);
+      return factory.createStructuredResponse(`Current position: (${pos.x}, ${pos.y}, ${pos.z})`, pos);
     }
   );
 
@@ -61,7 +61,12 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
         } else {
           await gotoPromise;
         }
-        return factory.createResponse(`Successfully moved to position near (${x}, ${y}, ${z})`);
+        return factory.createStructuredResponse(`Successfully moved to position near (${x}, ${y}, ${z})`, {
+          x,
+          y,
+          z,
+          range
+        });
       } catch (error) {
         if (timedOut) {
           throw new Error(`Move timed out after ${timeoutMs}ms`);
@@ -92,7 +97,7 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
 
       const bot = getBot();
       await bot.lookAt(new Vec3(x, y, z), true);
-      return factory.createResponse(`Looking at position (${x}, ${y}, ${z})`);
+      return factory.createStructuredResponse(`Looking at position (${x}, ${y}, ${z})`, { x, y, z });
     }
   );
 
@@ -104,7 +109,7 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
       const bot = getBot();
       bot.setControlState('jump', true);
       setTimeout(() => bot.setControlState('jump', false), 250);
-      return factory.createResponse("Successfully jumped");
+      return factory.createStructuredResponse("Successfully jumped", { action: 'jump', durationMs: 250 });
     }
   );
 
@@ -121,7 +126,10 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
         bot.setControlState(direction, true);
         setTimeout(() => {
           bot.setControlState(direction, false);
-          resolve(factory.createResponse(`Moved ${direction} for ${duration}ms`));
+          resolve(factory.createStructuredResponse(`Moved ${direction} for ${duration}ms`, {
+            direction,
+            duration
+          }));
         }, duration);
       });
     }

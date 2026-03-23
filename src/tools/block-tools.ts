@@ -33,7 +33,14 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       const blockAtPos = bot.blockAt(placePos);
 
       if (blockAtPos && blockAtPos.name !== 'air') {
-        return factory.createResponse(`There's already a block (${blockAtPos.name}) at (${x}, ${y}, ${z})`);
+        return factory.createStructuredResponse(`There's already a block (${blockAtPos.name}) at (${x}, ${y}, ${z})`, {
+          placed: false,
+          reason: 'occupied',
+          block: blockAtPos.name,
+          x,
+          y,
+          z
+        });
       }
 
       const possibleFaces: FaceOption[] = [
@@ -66,7 +73,13 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
 
           try {
             await bot.placeBlock(referenceBlock, face.vector.scaled(-1));
-            return factory.createResponse(`Placed block at (${x}, ${y}, ${z}) using ${face.direction} face`);
+            return factory.createStructuredResponse(`Placed block at (${x}, ${y}, ${z}) using ${face.direction} face`, {
+              placed: true,
+              x,
+              y,
+              z,
+              face: face.direction
+            });
           } catch (placeError) {
             log('warn', `Failed to place using ${face.direction} face: ${placeError}`);
             continue;
@@ -74,7 +87,13 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
         }
       }
 
-      return factory.createResponse(`Failed to place block at (${x}, ${y}, ${z}): No suitable reference block found`);
+      return factory.createStructuredResponse(`Failed to place block at (${x}, ${y}, ${z}): No suitable reference block found`, {
+        placed: false,
+        reason: 'no_reference_block',
+        x,
+        y,
+        z
+      });
     }
   );
 
@@ -94,7 +113,12 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       const block = bot.blockAt(blockPos);
 
       if (!block || block.name === 'air') {
-        return factory.createResponse(`No block found at position (${x}, ${y}, ${z})`);
+        return factory.createStructuredResponse(`No block found at position (${x}, ${y}, ${z})`, {
+          found: false,
+          x,
+          y,
+          z
+        });
       }
 
       if (!bot.canDigBlock(block) || !bot.canSeeBlock(block)) {
@@ -105,7 +129,12 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       }
 
       await bot.dig(block);
-      return factory.createResponse(`Dug ${block.name} at (${x}, ${y}, ${z})`);
+      return factory.createStructuredResponse(`Dug ${block.name} at (${x}, ${y}, ${z})`, {
+        block: block.name,
+        x,
+        y,
+        z
+      });
     }
   );
 
@@ -125,10 +154,24 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       const block = bot.blockAt(blockPos);
 
       if (!block) {
-        return factory.createResponse(`No block information found at position (${x}, ${y}, ${z})`);
+        return factory.createStructuredResponse(`No block information found at position (${x}, ${y}, ${z})`, {
+          found: false,
+          x,
+          y,
+          z
+        });
       }
 
-      return factory.createResponse(`Found ${block.name} (type: ${block.type}) at position (${block.position.x}, ${block.position.y}, ${block.position.z})`);
+      return factory.createStructuredResponse(`Found ${block.name} (type: ${block.type}) at position (${block.position.x}, ${block.position.y}, ${block.position.z})`, {
+        found: true,
+        block: {
+          name: block.name,
+          type: block.type,
+          x: block.position.x,
+          y: block.position.y,
+          z: block.position.z
+        }
+      });
     }
   );
 
@@ -145,7 +188,10 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       const blocksByName = mcData.blocksByName;
 
       if (!blocksByName[blockType]) {
-        return factory.createResponse(`Unknown block type: ${blockType}`);
+        return factory.createStructuredResponse(`Unknown block type: ${blockType}`, {
+          found: false,
+          blockType
+        });
       }
 
       const blockId = blocksByName[blockType].id;
@@ -156,10 +202,22 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       });
 
       if (!block) {
-        return factory.createResponse(`No ${blockType} found within ${maxDistance} blocks`);
+        return factory.createStructuredResponse(`No ${blockType} found within ${maxDistance} blocks`, {
+          found: false,
+          blockType,
+          maxDistance
+        });
       }
 
-      return factory.createResponse(`Found ${blockType} at position (${block.position.x}, ${block.position.y}, ${block.position.z})`);
+      return factory.createStructuredResponse(`Found ${blockType} at position (${block.position.x}, ${block.position.y}, ${block.position.z})`, {
+        found: true,
+        block: {
+          name: blockType,
+          x: block.position.x,
+          y: block.position.y,
+          z: block.position.z
+        }
+      });
     }
   );
 }

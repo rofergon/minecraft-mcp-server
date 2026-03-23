@@ -74,6 +74,7 @@ test('get-position returns current bot position', async (t) => {
   t.true(result.content[0].text.includes('100'));
   t.true(result.content[0].text.includes('64'));
   t.true(result.content[0].text.includes('200'));
+  t.deepEqual(result.structuredContent, { x: 100, y: 64, z: 200 });
 });
 
 test('move-to-position returns error when pathfinding fails', async (t) => {
@@ -171,6 +172,7 @@ test('move-to-position succeeds without timeout and does not stop pathfinder', a
   t.falsy(result.isError);
   t.true(result.content[0].text.includes('Successfully moved'));
   t.true((mockBot.pathfinder!.stop as sinon.SinonStub).notCalled);
+  t.deepEqual(result.structuredContent, { x: 100, y: 64, z: 200, range: 1 });
 });
 
 test.serial('move-to-position succeeds before timeout and does not stop pathfinder', async (t) => {

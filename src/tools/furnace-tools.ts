@@ -51,18 +51,32 @@ export function registerFurnaceTools(factory: ToolFactory, getBot: () => minefla
       const furnaceBlock = bot.blockAt(furnacePos);
 
       if (!furnaceBlock || !FURNACE_BLOCKS.has(furnaceBlock.name)) {
-        return factory.createResponse(`No furnace block found at (${x}, ${y}, ${z})`);
+        return factory.createStructuredResponse(`No furnace block found at (${x}, ${y}, ${z})`, {
+          started: false,
+          found: false,
+          x,
+          y,
+          z
+        });
       }
 
       const items = bot.inventory.items();
       const input = items.find((item) => item.name.includes(inputItem.toLowerCase()));
       if (!input) {
-        return factory.createResponse(`Couldn't find any item matching '${inputItem}' in inventory`);
+        return factory.createStructuredResponse(`Couldn't find any item matching '${inputItem}' in inventory`, {
+          started: false,
+          missing: 'input',
+          inputItem
+        });
       }
 
       const fuel = items.find((item) => item.name.includes(fuelItem.toLowerCase()));
       if (!fuel) {
-        return factory.createResponse(`Couldn't find any fuel item matching '${fuelItem}' in inventory`);
+        return factory.createStructuredResponse(`Couldn't find any fuel item matching '${fuelItem}' in inventory`, {
+          started: false,
+          missing: 'fuel',
+          fuelItem
+        });
       }
 
       const resolvedInputCount = Math.min(inputCount, input.count);
@@ -80,30 +94,58 @@ export function registerFurnaceTools(factory: ToolFactory, getBot: () => minefla
       try {
         const existingInput = furnace.inputItem();
         if (existingInput && existingInput.name !== input.name) {
-          return factory.createResponse(`Furnace input slot is occupied by ${existingInput.name}`);
+          return factory.createStructuredResponse(`Furnace input slot is occupied by ${existingInput.name}`, {
+            started: false,
+            occupiedSlot: 'input',
+            occupant: existingInput.name
+          });
         }
 
         const existingFuel = furnace.fuelItem();
         if (existingFuel && existingFuel.name !== fuel.name) {
-          return factory.createResponse(`Furnace fuel slot is occupied by ${existingFuel.name}`);
+          return factory.createStructuredResponse(`Furnace fuel slot is occupied by ${existingFuel.name}`, {
+            started: false,
+            occupiedSlot: 'fuel',
+            occupant: existingFuel.name
+          });
         }
 
         await furnace.putFuel(fuel.type, fuel.metadata ?? null, resolvedFuelCount);
         await furnace.putInput(input.type, input.metadata ?? null, resolvedInputCount);
 
         if (!takeOutput) {
-          return factory.createResponse(
-            `Started smelting ${resolvedInputCount} ${input.name} with ${resolvedFuelCount} ${fuel.name}`
+          return factory.createStructuredResponse(
+            `Started smelting ${resolvedInputCount} ${input.name} with ${resolvedFuelCount} ${fuel.name}`,
+            {
+              started: true,
+              completed: false,
+              input: { name: input.name, count: resolvedInputCount },
+              fuel: { name: fuel.name, count: resolvedFuelCount },
+              x,
+              y,
+              z
+            }
           );
         }
 
         const output = await waitForOutput(furnace, timeoutMs);
         if (!output) {
-          return factory.createResponse(`No output after ${timeoutMs}ms`);
+          return factory.createStructuredResponse(`No output after ${timeoutMs}ms`, {
+            started: true,
+            completed: false,
+            timeoutMs
+          });
         }
 
         const taken = await furnace.takeOutput();
-        return factory.createResponse(`Smelted ${taken.count} ${taken.name}`);
+        return factory.createStructuredResponse(`Smelted ${taken.count} ${taken.name}`, {
+          started: true,
+          completed: true,
+          output: {
+            name: taken.name,
+            count: taken.count
+          }
+        });
       } finally {
         cleanup();
       }

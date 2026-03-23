@@ -73,6 +73,20 @@ export class ToolFactory {
     };
   }
 
+  createStructuredErrorResponse(error: Error | string, data: unknown): McpResponse {
+    const errorMessage = error instanceof Error ? error.message : error;
+    const structuredContent = this.normalizeStructuredContent(data);
+    if (!structuredContent) {
+      return this.createErrorResponse(errorMessage);
+    }
+
+    return {
+      content: [{ type: "text", text: `Failed: ${errorMessage}` }],
+      structuredContent,
+      isError: true
+    };
+  }
+
   private shouldValidateSchema(schema: Record<string, unknown>): boolean {
     const values = Object.values(schema);
     if (values.length === 0) {

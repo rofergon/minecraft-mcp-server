@@ -23,7 +23,10 @@ export function registerInventoryTools(factory: ToolFactory, getBot: () => minef
       }));
 
       if (items.length === 0) {
-        return factory.createResponse("Inventory is empty");
+        return factory.createStructuredResponse("Inventory is empty", {
+          items: [],
+          count: 0
+        });
       }
 
       let inventoryText = `Found ${items.length} items in inventory:\n\n`;
@@ -31,7 +34,10 @@ export function registerInventoryTools(factory: ToolFactory, getBot: () => minef
         inventoryText += `- ${item.name} (x${item.count}) in slot ${item.slot}\n`;
       });
 
-      return factory.createResponse(inventoryText);
+      return factory.createStructuredResponse(inventoryText, {
+        items: itemList,
+        count: itemList.length
+      });
     }
   );
 
@@ -49,9 +55,19 @@ export function registerInventoryTools(factory: ToolFactory, getBot: () => minef
       );
 
       if (item) {
-        return factory.createResponse(`Found ${item.count} ${item.name} in inventory (slot ${item.slot})`);
+        return factory.createStructuredResponse(`Found ${item.count} ${item.name} in inventory (slot ${item.slot})`, {
+          found: true,
+          item: {
+            name: item.name,
+            count: item.count,
+            slot: item.slot
+          }
+        });
       } else {
-        return factory.createResponse(`Couldn't find any item matching '${nameOrType}' in inventory`);
+        return factory.createStructuredResponse(`Couldn't find any item matching '${nameOrType}' in inventory`, {
+          found: false,
+          query: nameOrType
+        });
       }
     }
   );
@@ -71,11 +87,23 @@ export function registerInventoryTools(factory: ToolFactory, getBot: () => minef
       );
 
       if (!item) {
-        return factory.createResponse(`Couldn't find any item matching '${itemName}' in inventory`);
+        return factory.createStructuredResponse(`Couldn't find any item matching '${itemName}' in inventory`, {
+          equipped: false,
+          query: itemName,
+          destination
+        });
       }
 
       await bot.equip(item, destination as mineflayer.EquipmentDestination);
-      return factory.createResponse(`Equipped ${item.name} to ${destination}`);
+      return factory.createStructuredResponse(`Equipped ${item.name} to ${destination}`, {
+        equipped: true,
+        item: {
+          name: item.name,
+          count: item.count,
+          slot: item.slot
+        },
+        destination
+      });
     }
   );
 }

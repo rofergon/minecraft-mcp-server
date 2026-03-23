@@ -24,11 +24,25 @@ export function registerEntityTools(factory: ToolFactory, getBot: () => Bot): vo
       const entity = bot.nearestEntity(entityFilter);
 
       if (!entity || bot.entity.position.distanceTo(entity.position) > maxDistance) {
-        return factory.createResponse(`No ${type || 'entity'} found within ${maxDistance} blocks`);
+        return factory.createStructuredResponse(`No ${type || 'entity'} found within ${maxDistance} blocks`, {
+          found: false,
+          type: type || 'entity',
+          maxDistance
+        });
       }
 
       const entityName = entity.name || (entity as { username?: string }).username || entity.type;
-      return factory.createResponse(`Found ${entityName} at position (${Math.floor(entity.position.x)}, ${Math.floor(entity.position.y)}, ${Math.floor(entity.position.z)})`);
+      return factory.createStructuredResponse(`Found ${entityName} at position (${Math.floor(entity.position.x)}, ${Math.floor(entity.position.y)}, ${Math.floor(entity.position.z)})`, {
+        found: true,
+        entity: {
+          name: entityName,
+          type: entity.type,
+          x: Math.floor(entity.position.x),
+          y: Math.floor(entity.position.y),
+          z: Math.floor(entity.position.z),
+          distance: bot.entity.position.distanceTo(entity.position)
+        }
+      });
     }
   );
 }

@@ -161,6 +161,7 @@ test('read-chat respects count parameter', async (t) => {
   const result = await executor({ count: 5 });
 
   t.true(result.content[0].text.includes('5 chat message'));
+  t.is(result.structuredContent.count, 5);
 });
 
 test('read-chat limits count to max messages', async (t) => {

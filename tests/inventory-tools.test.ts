@@ -71,6 +71,7 @@ test('list-inventory returns empty when no items', async (t) => {
   const result = await executor({});
 
   t.true(result.content[0].text.includes('empty'));
+  t.deepEqual(result.structuredContent, { items: [], count: 0 });
 });
 
 test('list-inventory returns items with counts', async (t) => {
@@ -103,6 +104,8 @@ test('list-inventory returns items with counts', async (t) => {
   t.true(result.content[0].text.includes('diamond_pickaxe'));
   t.true(result.content[0].text.includes('cobblestone'));
   t.true(result.content[0].text.includes('64'));
+  t.is(result.structuredContent.count, 2);
+  t.true(Array.isArray(result.structuredContent.items));
 });
 
 test('equip-item calls bot.equip', async (t) => {
@@ -136,6 +139,8 @@ test('equip-item calls bot.equip', async (t) => {
   t.true(equipStub.calledOnce);
   t.true(result.content[0].text.includes('Equipped'));
   t.true(result.content[0].text.includes('diamond_sword'));
+  t.is(result.structuredContent.equipped, true);
+  t.is(result.structuredContent.destination, 'hand');
 });
 
 test('equip-item returns message when item not found', async (t) => {

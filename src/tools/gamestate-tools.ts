@@ -8,7 +8,9 @@ export function registerGameStateTools(factory: ToolFactory, getBot: () => minef
     {},
     async () => {
       const bot = getBot();
-      return factory.createResponse(`Bot gamemode: "${bot.game.gameMode}"`);
+      return factory.createStructuredResponse(`Bot gamemode: "${bot.game.gameMode}"`, {
+        gameMode: bot.game.gameMode
+      });
     }
   );
 }

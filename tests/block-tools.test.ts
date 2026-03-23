@@ -118,6 +118,8 @@ test('get-block-info returns block information', async (t) => {
   t.true(result.content[0].text.includes('10'));
   t.true(result.content[0].text.includes('64'));
   t.true(result.content[0].text.includes('20'));
+  t.is(result.structuredContent.found, true);
+  t.is(result.structuredContent.block.name, 'stone');
 });
 
 test('get-block-info handles missing block', async (t) => {
@@ -143,6 +145,7 @@ test('get-block-info handles missing block', async (t) => {
   const result = await executor({ x: 10, y: 64, z: 20 });
 
   t.true(result.content[0].text.includes('No block information found'));
+  t.is(result.structuredContent.found, false);
 });
 
 test('dig-block handles air blocks', async (t) => {
@@ -171,6 +174,7 @@ test('dig-block handles air blocks', async (t) => {
   const result = await executor({ x: 10, y: 64, z: 20 });
 
   t.true(result.content[0].text.includes('No block found'));
+  t.is(result.structuredContent.found, false);
 });
 
 test('dig-block uses the bot height as the approach level for tall blocks', async (t) => {
@@ -205,11 +209,11 @@ test('dig-block uses the bot height as the approach level for tall blocks', asyn
   await executor({ x: 10, y: 68, z: 20 });
 
   t.true(pathfinderGoto.calledOnce);
-  const goal = pathfinderGoto.firstCall.args[0] as { x: number; y: number; z: number; range: number };
+  const goal = pathfinderGoto.firstCall.args[0] as { x: number; y: number; z: number; rangeSq: number };
   t.is(goal.x, 10);
   t.is(goal.y, 64);
   t.is(goal.z, 20);
-  t.is(goal.range, 1);
+  t.is(goal.rangeSq, 1);
 });
 
 test('find-block returns not found when block not found', async (t) => {

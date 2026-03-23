@@ -383,7 +383,11 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
       }
 
       if (availableRecipes.length === 0) {
-        return factory.createResponse(`No craftable recipes found${outputItem ? ` for ${outputItem}` : ''} with current inventory`);
+        return factory.createStructuredResponse(`No craftable recipes found${outputItem ? ` for ${outputItem}` : ''} with current inventory`, {
+          recipes: [],
+          count: 0,
+          outputItem: outputItem ?? null
+        });
       }
 
       let output = `Found ${availableRecipes.length} craftable recipe(s):\n\n`;
@@ -392,7 +396,11 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
         output += `   Ingredients: ${recipe.ingredients.map(i => `${i.name} x${i.count}`).join(", ")}\n\n`;
       });
 
-      return factory.createResponse(output);
+      return factory.createStructuredResponse(output, {
+        recipes: availableRecipes,
+        count: availableRecipes.length,
+        outputItem: outputItem ?? null
+      });
     }
   );
 
@@ -461,9 +469,17 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
 
         if (!craftedThisAttempt && attempt === 0) {
           if (bestCannotCraft) {
-            return factory.createErrorResponse(bestCannotCraft.message);
+            return factory.createStructuredErrorResponse(bestCannotCraft.message, {
+              crafted: false,
+              outputItem,
+              craftedCount: 0
+            });
           }
-          return factory.createErrorResponse(`Failed to craft ${outputItem}: ${lastError || 'Recipe not found or missing ingredients'}`);
+          return factory.createStructuredErrorResponse(`Failed to craft ${outputItem}: ${lastError || 'Recipe not found or missing ingredients'}`, {
+            crafted: false,
+            outputItem,
+            craftedCount: 0
+          });
         }
 
         if (!craftedThisAttempt) {
@@ -472,10 +488,18 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
       }
 
       if (craftedCount === 0) {
-        return factory.createErrorResponse(`Failed to craft ${outputItem}: ${lastError || "Missing ingredients or recipe not found"}`);
+        return factory.createStructuredErrorResponse(`Failed to craft ${outputItem}: ${lastError || "Missing ingredients or recipe not found"}`, {
+          crafted: false,
+          outputItem,
+          craftedCount: 0
+        });
       }
 
-      return factory.createResponse(`Successfully crafted ${outputItem} ${craftedCount} time(s)`);
+      return factory.createStructuredResponse(`Successfully crafted ${outputItem} ${craftedCount} time(s)`, {
+        crafted: true,
+        outputItem,
+        craftedCount
+      });
     }
   );
 
@@ -519,7 +543,11 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
         });
 
       if (matchingRecipes.length === 0) {
-        return factory.createResponse(`No recipes found for ${itemName}`);
+        return factory.createStructuredResponse(`No recipes found for ${itemName}`, {
+          recipes: [],
+          count: 0,
+          itemName
+        });
       }
 
       let output = `Recipe(s) for ${itemName}:\n\n`;
@@ -535,7 +563,11 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
         output += '\n';
       });
 
-      return factory.createResponse(output);
+      return factory.createStructuredResponse(output, {
+        recipes: matchingRecipes,
+        count: matchingRecipes.length,
+        itemName
+      });
     }
   );
 
@@ -561,15 +593,27 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
       const candidatesFromBotWithTable = table ? collectCandidateRecipesFromBot(bot, mcData, itemName, itemsById, table) : [];
       const candidatesFromBot = candidatesFromBotNoTable.length > 0 ? candidatesFromBotNoTable : candidatesFromBotWithTable;
       const candidates = candidatesFromBot.length > 0 ? candidatesFromBot : collectCandidateRecipes(recipes, itemName, itemsById);
-      if (candidates.length === 0) return factory.createResponse(`No recipe found for ${itemName}`);
+      if (candidates.length === 0) {
+        return factory.createStructuredResponse(`No recipe found for ${itemName}`, {
+          canCraft: false,
+          itemName,
+          missing: []
+        });
+      }
 
       let bestCannotCraft: { missingTotal: number; message: string } | null = null;
+      let bestCannotCraftMissing: RecipeIngredient[] = [];
 
       for (const candidate of candidates) {
         const evaluation = evaluateRecipeMissing(candidate.recipe, inventory, itemsById);
 
         if (evaluation.canCraft) {
-          return factory.createResponse(`Yes, can craft ${candidate.resultName}. Have all required ingredients.`);
+          return factory.createStructuredResponse(`Yes, can craft ${candidate.resultName}. Have all required ingredients.`, {
+            canCraft: true,
+            itemName,
+            resultName: candidate.resultName,
+            missing: []
+          });
         }
 
         let output = `Cannot craft ${candidate.resultName}. Missing:\n`;
@@ -579,10 +623,15 @@ export function registerCraftingTools(factory: ToolFactory, getBot: () => minefl
 
         if (!bestCannotCraft || evaluation.missingTotal < bestCannotCraft.missingTotal) {
           bestCannotCraft = { missingTotal: evaluation.missingTotal, message: output };
+          bestCannotCraftMissing = evaluation.missing;
         }
       }
 
-      return factory.createResponse(bestCannotCraft?.message ?? `No recipe found for ${itemName}`);
+      return factory.createStructuredResponse(bestCannotCraft?.message ?? `No recipe found for ${itemName}`, {
+        canCraft: false,
+        itemName,
+        missing: bestCannotCraftMissing
+      });
     }
   );
 }

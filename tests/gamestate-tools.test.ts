@@ -51,6 +51,7 @@ test('detect-gamemode returns creative mode', async (t) => {
   const result = await executor({});
 
   t.true(result.content[0].text.includes('creative'));
+  t.deepEqual(result.structuredContent, { gameMode: 'creative' });
 });
 
 test('detect-gamemode returns survival mode', async (t) => {
