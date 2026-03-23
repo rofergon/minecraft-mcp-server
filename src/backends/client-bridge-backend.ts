@@ -80,7 +80,8 @@ const CLIENT_BRIDGE_PROTOCOL_VERSION = '1.0.0';
 const DEFAULT_CONNECT_TIMEOUT_MS = 4000;
 const DEFAULT_ACTION_TIMEOUT_MS = 15000;
 const ACTION_TIMEOUT_MS_BY_ACTION: Record<string, number> = {
-  'harvest-wood': 10 * 60 * 1000
+  'harvest-wood': 10 * 60 * 1000,
+  'mine-cobblestone': 10 * 60 * 1000
 };
 
 export class ClientBridgeBackend implements GameBackend {
@@ -190,6 +191,12 @@ export class ClientBridgeBackend implements GameBackend {
   }
 
   async getRuntimeCapabilities(): Promise<RuntimeCapabilities> {
+    try {
+      await this.ensureConnected(DEFAULT_CONNECT_TIMEOUT_MS);
+    } catch {
+      // Return the best-known cached state when the bridge is unavailable.
+    }
+
     return {
       mode: 'client-bridge',
       selectedBackend: this.kind,

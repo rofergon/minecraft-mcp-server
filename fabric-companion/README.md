@@ -42,7 +42,7 @@ Current behavior:
 - Avoids the previous infinite-jump behavior on elevated logs
 - Clears obstructing leaves in front of the player when they block access to the trunk
 - Sends periodic progress updates through `chat_event`
-- Mines nearby `cobblestone` blocks autonomously and reports progress in batches
+- Mines nearby `stone` or `cobblestone`, counts collected `cobblestone`, and can clear soft obstructions such as dirt or leaves when they block access
 
 This keeps long harvesting runs inside the mod so the MCP agent does not need to spend tokens micromanaging every single block.
 

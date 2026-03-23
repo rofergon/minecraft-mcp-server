@@ -173,6 +173,15 @@ const PASSTHROUGH_TOOLS: ToolSpec[] = [
     }
   },
   {
+    name: 'mine-cobblestone',
+    description: 'Autonomously mine cobblestone until the requested amount is collected',
+    schema: {
+      amount: z.number().int().min(1).describe('Target number of cobblestone items to collect'),
+      maxRadius: z.coerce.number().int().min(4).max(96).optional().describe('Maximum horizontal search radius (default: 32)'),
+      reportEvery: z.coerce.number().int().min(1).max(64).optional().describe('Send a progress update every N processed blocks (default: 15)')
+    }
+  },
+  {
     name: 'smelt-item',
     description: 'Smelt items using a furnace-like block',
     schema: {

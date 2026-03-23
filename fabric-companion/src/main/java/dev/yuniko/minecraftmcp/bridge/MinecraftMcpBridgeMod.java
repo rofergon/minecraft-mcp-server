@@ -1,10 +1,8 @@
 package dev.yuniko.minecraftmcp.bridge;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.BlockState;
@@ -25,33 +23,38 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 public final class MinecraftMcpBridgeMod implements ClientModInitializer {
-    private static final Gson GSON = new Gson();
     private static final String PROTOCOL_VERSION = "1.0.0";
     private static final String BRIDGE_VERSION = "0.1.0";
+    private static final Set<String> CLEARABLE_SOFT_BLOCKS = Set.of(
+        "dirt",
+        "grass_block",
+        "coarse_dirt",
+        "podzol",
+        "rooted_dirt",
+        "mud",
+        "muddy_mangrove_roots",
+        "gravel",
+        "sand",
+        "red_sand",
+        "short_grass",
+        "tall_grass",
+        "fern",
+        "large_fern",
+        "moss_block",
+        "moss_carpet"
+    );
     private static final Set<String> SUPPORTED_ACTIONS = Set.of(
         "get-position",
         "list-inventory",
@@ -60,6 +63,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         "move-to-position",
         "dig-block",
         "harvest-wood",
+        "mine-cobblestone",
         "get-block-info",
         "find-block",
         "detect-gamemode",
@@ -68,96 +72,22 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
 
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor();
-    private final AtomicReference<ClientConnection> activeConnection = new AtomicReference<>();
+    private final ClientThreadExecutor clientThreadExecutor = new ClientThreadExecutor();
+    private final ActionDispatcher actionDispatcher = new ActionDispatcher(new BridgeActionHandler());
     private BridgeConfig config;
+    private BridgeServer bridgeServer;
     private volatile boolean lastWorldReady = false;
 
     @Override
     public void onInitializeClient() {
-        this.config = loadConfig();
-        startBridgeServer();
+        this.config = BridgeConfig.load();
+        System.out.println("[minecraft-mcp-bridge] Initializing bridge on " + config.host() + ":" + config.port());
+        this.bridgeServer = new BridgeServer(config, executor, new BridgeTransportListener());
+        bridgeServer.start();
         monitor.scheduleAtFixedRate(this::monitorWorldState, 0, 500, TimeUnit.MILLISECONDS);
     }
 
-    private void startBridgeServer() {
-        executor.submit(() -> {
-            try (ServerSocket serverSocket = new ServerSocket(config.port(), 1, InetAddress.getByName(config.host()))) {
-                while (!Thread.currentThread().isInterrupted()) {
-                    Socket socket = serverSocket.accept();
-                    executor.submit(() -> handleClient(socket));
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        });
-    }
-
-    private void handleClient(Socket socket) {
-        closeActiveConnection();
-        ClientConnection connection = null;
-
-        try (
-            socket;
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            PrintWriter writer = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8)
-        ) {
-            connection = new ClientConnection(socket, writer);
-            activeConnection.set(connection);
-
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.isBlank()) {
-                    continue;
-                }
-
-                JsonObject message = JsonParser.parseString(line).getAsJsonObject();
-                handleMessage(message);
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        } finally {
-            if (connection != null) {
-                activeConnection.compareAndSet(connection, null);
-            }
-        }
-    }
-
-    private void handleMessage(JsonObject message) {
-        String type = getAsString(message, "type");
-        if (type == null) {
-            return;
-        }
-
-        if (type.equals("hello")) {
-            if (!isTokenValid(message)) {
-                sendError(null, "Bridge token validation failed.");
-                return;
-            }
-
-            sendHello();
-            sendCapabilities();
-            sendSessionState();
-            sendRegistrySnapshot();
-            return;
-        }
-
-        if (type.equals("action_request")) {
-            handleActionRequest(message);
-        }
-    }
-
-    private void handleActionRequest(JsonObject message) {
-        String requestId = getAsString(message, "requestId");
-        String action = getAsString(message, "action");
-        JsonObject args = message.has("args") && message.get("args").isJsonObject()
-            ? message.getAsJsonObject("args")
-            : new JsonObject();
-
-        if (requestId == null || action == null) {
-            sendError(requestId, "Malformed action_request message.");
-            return;
-        }
-
+    private void handleActionRequest(String requestId, String action, JsonObject args) {
         if (!SUPPORTED_ACTIONS.contains(action)) {
             sendError(requestId, "Action '" + action + "' is not yet supported by the Fabric companion.");
             return;
@@ -180,6 +110,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             case "move-to-position" -> executor.submit(() -> handleMoveToPosition(requestId, args));
             case "dig-block" -> executor.submit(() -> handleDigBlock(requestId, args));
             case "harvest-wood" -> executor.submit(() -> handleHarvestWood(requestId, args));
+            case "mine-cobblestone" -> executor.submit(() -> handleMineCobblestone(requestId, args));
             case "get-block-info" -> handleGetBlockInfo(requestId, world, args);
             case "find-block" -> handleFindBlock(requestId, player, world, args);
             case "detect-gamemode" -> handleDetectGamemode(requestId, client);
@@ -394,6 +325,36 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
     }
 
+    private void handleMineCobblestone(String requestId, JsonObject args) {
+        Integer amount = getAsInt(args, "amount");
+        int maxRadius = getAsInt(args, "maxRadius") != null ? Objects.requireNonNull(getAsInt(args, "maxRadius")) : 32;
+        int reportEvery = getAsInt(args, "reportEvery") != null ? Objects.requireNonNull(getAsInt(args, "reportEvery")) : 15;
+
+        if (amount == null || amount < 1) {
+            sendError(requestId, "amount must be a positive integer.");
+            return;
+        }
+
+        try {
+            MineCobblestoneResult result = mineCobblestoneSync(amount, maxRadius, reportEvery);
+            JsonObject data = new JsonObject();
+            data.addProperty("processed", result.processed());
+            data.addProperty("collected", result.collected());
+            data.addProperty("requested", result.requested());
+            data.addProperty("block", result.block());
+            data.addProperty("x", result.position().getX());
+            data.addProperty("y", result.position().getY());
+            data.addProperty("z", result.position().getZ());
+            sendActionResult(
+                requestId,
+                "Mined " + result.collected() + " cobblestone after processing " + result.processed() + " block(s).",
+                data
+            );
+        } catch (Exception error) {
+            sendError(requestId, error.getMessage());
+        }
+    }
+
     private void handleFindBlock(String requestId, ClientPlayerEntity player, ClientWorld world, JsonObject args) {
         String query = lower(getAsString(args, "blockType"));
         int maxDistance = getAsInt(args, "maxDistance") != null ? Objects.requireNonNull(getAsInt(args, "maxDistance")) : 16;
@@ -469,124 +430,70 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private void sendHello() {
-        JsonObject hello = new JsonObject();
-        hello.addProperty("type", "hello");
-        hello.addProperty("protocolVersion", PROTOCOL_VERSION);
-        hello.addProperty("bridgeVersion", BRIDGE_VERSION);
-        send(hello);
+        send(BridgeProtocolMessages.hello(PROTOCOL_VERSION, BRIDGE_VERSION));
     }
 
     private void sendCapabilities() {
-        JsonObject capabilities = new JsonObject();
-        capabilities.addProperty("type", "capabilities");
-        capabilities.addProperty("protocolVersion", PROTOCOL_VERSION);
-        capabilities.addProperty("bridgeVersion", BRIDGE_VERSION);
-        capabilities.addProperty("minecraftVersion", "1.21.11");
-        capabilities.addProperty("loader", "fabric");
-        capabilities.addProperty("loaderVersion", FabricLoader.getInstance().getModContainer("fabricloader")
-            .map(container -> container.getMetadata().getVersion().getFriendlyString())
-            .orElse("unknown"));
-        capabilities.addProperty("worldReady", isWorldReady());
-
-        JsonArray supported = new JsonArray();
-        for (String action : SUPPORTED_ACTIONS) {
-            supported.add(action);
-        }
-        capabilities.add("supportedActions", supported);
-
-        JsonArray notes = new JsonArray();
-        notes.add("Fabric MVP bridge: read-only registry access plus a small set of player actions.");
-        notes.add("Unsupported actions return explicit errors for MCP capability negotiation.");
-        capabilities.add("notes", notes);
-        send(capabilities);
+        send(BridgeProtocolMessages.capabilities(
+            PROTOCOL_VERSION,
+            BRIDGE_VERSION,
+            "1.21.11",
+            "fabric",
+            FabricLoader.getInstance().getModContainer("fabricloader")
+                .map(container -> container.getMetadata().getVersion().getFriendlyString())
+                .orElse("unknown"),
+            isWorldReady(),
+            SUPPORTED_ACTIONS,
+            List.of(
+                "Fabric MVP bridge: read-only registry access plus a small set of player actions.",
+                "Unsupported actions return explicit errors for MCP capability negotiation."
+            )
+        ));
     }
 
     private void sendSessionState() {
-        JsonObject state = new JsonObject();
-        state.addProperty("type", "session_state");
-        state.addProperty("worldReady", isWorldReady());
-
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player != null) {
-            state.addProperty("connected", true);
-            state.addProperty("playerName", client.player.getName().getString());
-        } else {
-            state.addProperty("connected", false);
-        }
-
-        if (client.world != null && client.world.getRegistryKey() != null) {
-            state.addProperty("dimension", client.world.getRegistryKey().getValue().toString());
-        }
-
-        send(state);
+        send(BridgeProtocolMessages.sessionState(
+            isWorldReady(),
+            client.player != null,
+            client.player != null ? client.player.getName().getString() : null,
+            client.world != null && client.world.getRegistryKey() != null
+                ? client.world.getRegistryKey().getValue().toString()
+                : null
+        ));
     }
 
     private void sendRegistrySnapshot() {
-        JsonObject snapshot = new JsonObject();
-        snapshot.addProperty("type", "registry_snapshot");
-        snapshot.add("blocks", toIdentifierArray(Registries.BLOCK.getIds()));
-        snapshot.add("items", toIdentifierArray(Registries.ITEM.getIds()));
-        snapshot.add("entities", toIdentifierArray(Registries.ENTITY_TYPE.getIds()));
-        snapshot.add("namespaces", collectNamespaces());
-        send(snapshot);
-    }
-
-    private JsonArray collectNamespaces() {
-        Set<String> namespaces = new HashSet<>();
-        Registries.BLOCK.getIds().forEach(id -> namespaces.add(id.getNamespace()));
-        Registries.ITEM.getIds().forEach(id -> namespaces.add(id.getNamespace()));
-        Registries.ENTITY_TYPE.getIds().forEach(id -> namespaces.add(id.getNamespace()));
-
-        JsonArray out = new JsonArray();
-        namespaces.stream().sorted().forEach(out::add);
-        return out;
-    }
-
-    private JsonArray toIdentifierArray(Iterable<Identifier> identifiers) {
-        JsonArray array = new JsonArray();
-        for (Identifier id : identifiers) {
-            array.add(id.toString());
-        }
-        return array;
+        send(BridgeProtocolMessages.registrySnapshot(
+            Registries.BLOCK.getIds(),
+            Registries.ITEM.getIds(),
+            Registries.ENTITY_TYPE.getIds()
+        ));
     }
 
     private void sendActionResult(String requestId, String message, JsonElement data) {
-        JsonObject result = new JsonObject();
-        result.addProperty("type", "action_result");
-        result.addProperty("requestId", requestId);
-        result.addProperty("message", message);
-        result.add("data", data);
-        result.addProperty("isError", false);
-        send(result);
+        send(BridgeProtocolMessages.actionResult(requestId, message, data));
     }
 
     private void sendError(String requestId, String message) {
-        JsonObject error = new JsonObject();
-        error.addProperty("type", "error");
-        if (requestId != null) {
-            error.addProperty("requestId", requestId);
-        }
-        error.addProperty("message", message);
-        send(error);
+        send(BridgeProtocolMessages.error(requestId, message));
     }
 
     private void sendJobProgress(String channel, String message) {
-        JsonObject progress = new JsonObject();
-        progress.addProperty("type", "chat_event");
-        progress.addProperty("username", channel);
-        progress.addProperty("message", message);
-        send(progress);
+        send(BridgeProtocolMessages.chatEvent(channel, message));
     }
 
     private void send(JsonObject payload) {
-        ClientConnection connection = activeConnection.get();
-        if (connection == null) {
+        if (bridgeServer == null) {
             return;
         }
 
-        synchronized (connection.writer()) {
-            connection.writer().println(GSON.toJson(payload));
+        ProtocolSession session = bridgeServer.getActiveSession();
+        if (session == null) {
+            return;
         }
+
+        session.send(payload);
     }
 
     private void broadcastSessionState() {
@@ -669,8 +576,24 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             return Registries.BLOCK.getId(state.getBlock()).toString();
         });
 
-        ReachabilityResult initialReachability = callOnClientThread(() -> isBlockReachableNow(pos));
-        if (!initialReachability.reachable()) {
+        int clearedObstructions = 0;
+        while (true) {
+            ReachabilityResult initialReachability = callOnClientThread(() -> isBlockReachableNow(pos));
+            if (initialReachability.reachable()) {
+                break;
+            }
+
+            BlockPos obstruction = callOnClientThread(() -> findClearableDigObstruction(pos));
+            if (obstruction != null) {
+                if (clearedObstructions++ >= 4) {
+                    throw new IllegalStateException(
+                        "Too many obstructing blocks while trying to dig target at (" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")"
+                    );
+                }
+                digBlockSync(obstruction);
+                continue;
+            }
+
             DigCandidate candidate = callOnClientThread(() -> selectBestDigCandidate(findDigCandidates(pos)));
             if (candidate == null) {
                 throw new IllegalStateException(
@@ -678,6 +601,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                 );
             }
             moveToPositionSync(candidate.standPosition(), candidate.range(), 15000L, true, true);
+            break;
         }
 
         try {
@@ -689,6 +613,12 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                 }
 
                 if (tick.needsReposition()) {
+                    BlockPos obstruction = callOnClientThread(() -> findClearableDigObstruction(pos));
+                    if (obstruction != null) {
+                        digBlockSync(obstruction);
+                        continue;
+                    }
+
                     DigCandidate candidate = callOnClientThread(() -> selectBestDigCandidate(findDigCandidates(pos)));
                     if (candidate == null) {
                         throw new IllegalStateException(
@@ -752,6 +682,52 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         return new HarvestWoodResult(amount, collected, processed, normalizedType, finalPosition);
+    }
+
+    private MineCobblestoneResult mineCobblestoneSync(int amount, int maxRadius, int reportEvery) throws Exception {
+        Set<String> targetBlocks = Set.of("stone", "cobblestone");
+        String targetItem = "cobblestone";
+        int startingCount = callOnClientThread(() -> countMatchingInventoryItems(targetItem));
+        int processed = 0;
+        int lastCollected = 0;
+        Set<BlockPos> ignoredTargets = new HashSet<>();
+
+        while (lastCollected < amount) {
+            MineTarget target = callOnClientThread(() -> findNearestMineTarget(targetBlocks, maxRadius, ignoredTargets));
+            if (target == null) {
+                break;
+            }
+
+            try {
+                digBlockSync(target.position());
+                collectDropsNearSync(target.position());
+                processed++;
+                lastCollected = Math.max(0, callOnClientThread(() -> countMatchingInventoryItems(targetItem)) - startingCount);
+                ignoredTargets.clear();
+
+                if (processed % reportEvery == 0 || lastCollected >= amount) {
+                    sendJobProgress(
+                        "mine-cobblestone",
+                        "Progress: " + lastCollected + "/" + amount + " cobblestone collected after processing " + processed + " block(s)."
+                    );
+                }
+            } catch (Exception error) {
+                ignoredTargets.add(target.position());
+                if (ignoredTargets.size() >= 24) {
+                    break;
+                }
+            }
+        }
+
+        int collected = Math.max(0, callOnClientThread(() -> countMatchingInventoryItems(targetItem)) - startingCount);
+        BlockPos finalPosition = callOnClientThread(this::currentPlayerBlockPos);
+        if (collected < amount) {
+            throw new IllegalStateException(
+                "Stopped after collecting " + collected + "/" + amount + " cobblestone. No more valid stone or cobblestone targets were found within " + maxRadius + " blocks."
+            );
+        }
+
+        return new MineCobblestoneResult(amount, collected, processed, targetItem, finalPosition);
     }
 
     private void collectDropsNearSync(BlockPos pos) throws Exception {
@@ -830,6 +806,78 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return total;
     }
 
+    private MineTarget findNearestMineTarget(Set<String> blockTypes, int maxRadius, Set<BlockPos> ignoredTargets) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientPlayerEntity player = client.player;
+        ClientWorld world = client.world;
+        if (player == null || world == null) {
+            return null;
+        }
+
+        BlockPos origin = BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
+        MineTarget bestTarget = null;
+        double bestScore = Double.MAX_VALUE;
+        int verticalRadius = Math.min(16, maxRadius);
+
+        for (int dx = -maxRadius; dx <= maxRadius; dx++) {
+            for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
+                for (int dz = -maxRadius; dz <= maxRadius; dz++) {
+                    BlockPos candidate = origin.add(dx, dy, dz);
+                    if (ignoredTargets.contains(candidate)) {
+                        continue;
+                    }
+
+                    BlockState state = world.getBlockState(candidate);
+                    Identifier id = Registries.BLOCK.getId(state.getBlock());
+                    if (!matchesAnyExactBlockType(id.toString(), blockTypes)) {
+                        continue;
+                    }
+
+                    boolean reachableNow = isBlockReachableNow(candidate).reachable();
+                    boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
+                    BlockPos obstruction = (!reachableNow && !canReposition) ? findClearableDigObstruction(candidate) : null;
+                    if (!reachableNow && !canReposition && obstruction == null) {
+                        continue;
+                    }
+
+                    double horizontalDistance = Math.pow(candidate.getX() - origin.getX(), 2) + Math.pow(candidate.getZ() - origin.getZ(), 2);
+                    double verticalPenalty = Math.max(0, candidate.getY() - origin.getY()) * 6.0D + Math.abs(candidate.getY() - origin.getY()) * 2.0D;
+                    double obstructionPenalty = obstruction != null ? 3.0D : 0.0D;
+                    double score = horizontalDistance + verticalPenalty + obstructionPenalty;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestTarget = new MineTarget(candidate, id.toString());
+                    }
+                }
+            }
+        }
+
+        return bestTarget;
+    }
+
+    private int countMatchingInventoryItems(String targetItem) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientPlayerEntity player = client.player;
+        if (player == null) {
+            return 0;
+        }
+
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
+            if (matchesExactBlockType(itemId, targetItem)) {
+                total += stack.getCount();
+            }
+        }
+
+        return total;
+    }
+
     private String normalizeHarvestType(String preferredType) {
         if (preferredType == null || preferredType.isBlank()) {
             return null;
@@ -856,6 +904,22 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         return localId.endsWith("_log");
+    }
+
+    private boolean matchesExactBlockType(String id, String targetType) {
+        String normalized = id.toLowerCase();
+        int separatorIndex = normalized.indexOf(':');
+        String localId = separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
+        return localId.equals(targetType.toLowerCase());
+    }
+
+    private boolean matchesAnyExactBlockType(String id, Set<String> targetTypes) {
+        for (String targetType : targetTypes) {
+            if (matchesExactBlockType(id, targetType)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private BlockPos currentPlayerBlockPos() {
@@ -889,12 +953,11 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         double totalDistance = current.distanceTo(target);
         stuckTracker.record(current, totalDistance);
 
-        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
-        player.setYaw(yaw);
-        player.setHeadYaw(yaw);
-        player.setBodyYaw(yaw);
-
         if (stuckTracker.isRecovering()) {
+            float recoveryYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
+            player.setYaw(recoveryYaw);
+            player.setHeadYaw(recoveryYaw);
+            player.setBodyYaw(recoveryYaw);
             client.options.forwardKey.setPressed(true);
             client.options.backKey.setPressed(false);
             client.options.leftKey.setPressed(stuckTracker.recoverLeft());
@@ -905,16 +968,34 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             return new MoveTickResult(false, current, NavigationState.STUCK_RECOVERY, "Recovering from obstacle");
         }
 
+        BlockPos persistentObstruction = stuckTracker.activeObstruction();
+        if (persistentObstruction != null) {
+            if (!isClearableFoliage(world, persistentObstruction)) {
+                stuckTracker.clearObstruction();
+                stopDigging(client);
+            } else {
+                stopMovement(client);
+                DigTickResult clearTick = updateDigTick(persistentObstruction);
+                if (!clearTick.blockPresent()) {
+                    stuckTracker.clearObstruction();
+                    stopDigging(client);
+                }
+                return new MoveTickResult(false, current, NavigationState.DIGGING, "Clearing obstructing block");
+            }
+        }
+
         boolean stepUp = allowJump && isStepUpPossible(player, world, target);
         boolean blocked = player.horizontalCollision || isObstructedAhead(player, world, target);
         BlockPos clearableObstruction = clearSoftObstructions ? findClearableObstructionAhead(player, world, target) : null;
         if (clearableObstruction != null) {
+            stuckTracker.setObstruction(clearableObstruction);
             stopMovement(client);
             DigTickResult clearTick = updateDigTick(clearableObstruction);
             if (!clearTick.blockPresent()) {
+                stuckTracker.clearObstruction();
                 stopDigging(client);
             }
-            return new MoveTickResult(false, current, NavigationState.DIGGING, "Clearing obstructing leaves");
+            return new MoveTickResult(false, current, NavigationState.DIGGING, "Clearing obstructing block");
         }
 
         if (stuckTracker.shouldStartRecovery(blocked)) {
@@ -922,6 +1003,11 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             stuckTracker.startRecovery();
             return new MoveTickResult(false, current, NavigationState.STUCK_RECOVERY, "Blocked without progress");
         }
+
+        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
+        player.setYaw(yaw);
+        player.setHeadYaw(yaw);
+        player.setBodyYaw(yaw);
 
         client.options.forwardKey.setPressed(true);
         client.options.backKey.setPressed(false);
@@ -1146,6 +1232,48 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return !state.isAir() && state.isIn(BlockTags.LEAVES);
     }
 
+    private BlockPos findClearableDigObstruction(BlockPos targetPos) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientPlayerEntity player = client.player;
+        ClientWorld world = client.world;
+        if (player == null || world == null) {
+            return null;
+        }
+
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (Direction face : Direction.values()) {
+            BlockPos candidate = targetPos.offset(face);
+            if (!isClearableMiningObstruction(world, candidate)) {
+                continue;
+            }
+
+            boolean reachableNow = isBlockReachableNow(candidate).reachable();
+            boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
+            if (!reachableNow && !canReposition) {
+                continue;
+            }
+
+            double distance = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(candidate));
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    private boolean isClearableMiningObstruction(ClientWorld world, BlockPos pos) {
+        BlockState state = world.getBlockState(pos);
+        if (state.isAir()) {
+            return false;
+        }
+
+        String localId = localBlockId(Registries.BLOCK.getId(state.getBlock()).toString());
+        return CLEARABLE_SOFT_BLOCKS.contains(localId) || state.isIn(BlockTags.LEAVES);
+    }
+
     private double getInteractionReach(ClientPlayerEntity player) {
         return player.isCreative() ? 5.0D : 4.5D;
     }
@@ -1181,16 +1309,8 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         player.setBodyYaw(yaw);
     }
 
-    private <T> T callOnClientThread(ClientTask<T> task) throws Exception {
-        CompletableFuture<T> future = new CompletableFuture<>();
-        MinecraftClient.getInstance().execute(() -> {
-            try {
-                future.complete(task.run());
-            } catch (Exception error) {
-                future.completeExceptionally(error);
-            }
-        });
-        return future.get(10L, TimeUnit.SECONDS);
+    private <T> T callOnClientThread(ClientThreadExecutor.ClientTask<T> task) throws Exception {
+        return clientThreadExecutor.call(task);
     }
 
     private boolean isTokenValid(JsonObject message) {
@@ -1200,32 +1320,6 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
 
         String incoming = getAsString(message, "token");
         return config.token().equals(incoming);
-    }
-
-    private void closeActiveConnection() {
-        ClientConnection current = activeConnection.getAndSet(null);
-        if (current == null) {
-            return;
-        }
-
-        try {
-            current.socket().close();
-        } catch (IOException ignored) {
-        }
-    }
-
-    private BridgeConfig loadConfig() {
-        Path path = FabricLoader.getInstance().getConfigDir().resolve("minecraft-mcp-bridge.json");
-        if (!Files.exists(path)) {
-            return new BridgeConfig("127.0.0.1", 25570, null);
-        }
-
-        try {
-            return GSON.fromJson(Files.readString(path), BridgeConfig.class);
-        } catch (IOException e) {
-            e.printStackTrace();
-            return new BridgeConfig("127.0.0.1", 25570, null);
-        }
     }
 
     private static String getAsString(JsonObject object, String memberName) {
@@ -1253,10 +1347,10 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return input == null ? null : input.toLowerCase();
     }
 
-    private record BridgeConfig(String host, int port, String token) {
-    }
-
-    private record ClientConnection(Socket socket, PrintWriter writer) {
+    private static String localBlockId(String id) {
+        String normalized = id.toLowerCase();
+        int separatorIndex = normalized.indexOf(':');
+        return separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
     }
 
     private enum NavigationState {
@@ -1277,6 +1371,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         private int recoveryTicksRemaining;
         private int recoveryAttempts;
         private boolean recoverLeft = true;
+        private BlockPos activeObstruction;
 
         void record(Vec3d current, double distanceToTarget) {
             long now = System.currentTimeMillis();
@@ -1317,6 +1412,18 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         int recoveryAttempts() {
             return recoveryAttempts;
         }
+
+        BlockPos activeObstruction() {
+            return activeObstruction;
+        }
+
+        void setObstruction(BlockPos obstruction) {
+            activeObstruction = obstruction;
+        }
+
+        void clearObstruction() {
+            activeObstruction = null;
+        }
     }
 
     private record MoveTickResult(boolean arrived, Vec3d position, NavigationState state, String status) {
@@ -1337,14 +1444,63 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private record HarvestWoodResult(int requested, int collected, int processed, String filter, BlockPos position) {
     }
 
+    private record MineTarget(BlockPos position, String blockId) {
+    }
+
+    private record MineCobblestoneResult(int requested, int collected, int processed, String block, BlockPos position) {
+    }
+
     private record ReachabilityResult(boolean reachable, Direction face, Vec3d aimPoint, double distanceSq, String reason) {
         private static ReachabilityResult unreachable(String reason) {
             return new ReachabilityResult(false, Direction.UP, Vec3d.ZERO, Double.MAX_VALUE, reason);
         }
     }
 
-    @FunctionalInterface
-    private interface ClientTask<T> {
-        T run() throws Exception;
+    private final class BridgeTransportListener implements BridgeServer.Listener {
+        @Override
+        public void onMessage(ProtocolSession session, JsonObject message) {
+            actionDispatcher.dispatch(session, message);
+        }
+
+        @Override
+        public void onSessionClosed(ProtocolSession session) {
+            // Reserved for future per-session cleanup hooks.
+        }
+
+        @Override
+        public void onSessionOpened(ProtocolSession session) {
+            // Reserved for future per-session initialization hooks.
+        }
+
+        @Override
+        public void onTransportError(String context, Exception error) {
+            System.err.println("[minecraft-mcp-bridge] " + context);
+            error.printStackTrace();
+        }
+    }
+
+    private final class BridgeActionHandler implements ActionDispatcher.Handler {
+        @Override
+        public void onActionRequest(ProtocolSession session, String requestId, String action, JsonObject args) {
+            handleActionRequest(requestId, action, args);
+        }
+
+        @Override
+        public void onHello(ProtocolSession session) {
+            sendHello();
+            sendCapabilities();
+            sendSessionState();
+            sendRegistrySnapshot();
+        }
+
+        @Override
+        public void onProtocolError(ProtocolSession session, String requestId, String message) {
+            sendError(requestId, message);
+        }
+
+        @Override
+        public boolean isTokenValid(JsonObject helloMessage) {
+            return MinecraftMcpBridgeMod.this.isTokenValid(helloMessage);
+        }
     }
 }
