@@ -4,7 +4,7 @@
 
 Este roadmap define el siguiente tramo del `client-bridge` de Fabric para convertir el agente actual en un MVP realmente util dentro de Minecraft survival temprano.
 
-Hoy el bridge ya puede resolver movimiento corto, inventario basico, `dig-block`, `find-block`, `harvest-wood`, `mine-cobblestone`, chat, `place-block` y la suite inicial de crafting. El loop principal de progreso ya quedo mucho mas cerca de cerrarse, aunque todavia faltan `smelt-item`, navegacion mas segura y supervivencia basica.
+Hoy el bridge ya puede resolver movimiento corto con navegacion defensiva basica, inventario basico, `dig-block`, `find-block`, `harvest-wood`, `mine-cobblestone`, chat, `place-block` y la suite inicial de crafting. El loop principal de progreso ya quedo mucho mas cerca de cerrarse, aunque todavia faltan `smelt-item` y supervivencia basica.
 
 El objetivo del MVP util es cerrar este loop:
 
@@ -34,7 +34,7 @@ El objetivo del MVP util es cerrar este loop:
   - `smelt-item`
 - Limitaciones actuales:
   - no hay uso de horno
-  - la navegacion sigue siendo corta y poco defensiva ante hazards
+  - la navegacion sigue siendo corta y reactiva; evita hazards obvios, pero no resuelve terreno complejo ni pathfinding largo
   - no existe loop de hambre/vida
   - el fallback de autocolocacion de `crafting_table` ya existe, pero sigue en validacion practica despues del ultimo ajuste
 
@@ -45,7 +45,7 @@ El objetivo del MVP util es cerrar este loop:
 | P1 | `place-block` funcional | Implementado end-to-end en Fabric | Reutilizar `place-block` | Ninguna | Puede colocar `crafting_table`, `furnace`, `torch` y bloques solidos en posiciones validas cercanas |
 | P2 | Suite de crafting | Implementada end-to-end en Fabric | Reutilizar esas 4 tools | `place-block` minimo para recipes 3x3 | Puede craftear `planks`, `sticks`, `crafting_table`, `wooden_pickaxe`, `stone_pickaxe` |
 | P3 | `smelt-item` | Tool declarada en TS, no implementada en Fabric | Reutilizar `smelt-item` | `place-block` | Puede usar un furnace cercano, meter input/fuel, esperar output y retirarlo |
-| P4 | Navegacion segura basica | Navegacion corta y reactiva, pero aun con gestion de riesgo insuficiente | Sin tools nuevas en v1; endurecer `move-to-position`, `harvest-wood`, `mine-cobblestone` | Ninguna | Evita lava obvia, caidas peligrosas, ahogo simple y aborta con errores explicitos |
+| P4 | Navegacion segura basica | Implementada en Fabric para rutas cortas | Sin tools nuevas en v1; endurecer `move-to-position`, `harvest-wood`, `mine-cobblestone` | Ninguna | Evita lava obvia, caidas peligrosas, ahogo simple y aborta con errores explicitos |
 | P5 | Supervivencia basica | No existe loop de hambre/vida | Nuevas tools `get-player-status` y `eat-food` | Idealmente `smelt-item`, pero no bloqueante | Detecta hambre baja, elige comida comestible del inventario y la consume |
 
 ## Habilidad 1: `place-block`
@@ -176,6 +176,8 @@ Mantener la tool existente:
 
 ## Habilidad 4: Navegacion segura basica
 
+Estado: implementada en Fabric para navegacion corta.
+
 ### Objetivo
 
 Reducir muertes y bloqueos tontos para que los jobs existentes sean mucho mas fiables.
@@ -211,6 +213,13 @@ No anadir tools nuevas en v1. Reforzar internamente:
 - Rehusa trayectorias obviamente peligrosas.
 - Los jobs largos no insisten ciegamente en una ruta danina.
 - Los errores devueltos distinguen entre atasco, peligro y timeout.
+
+### Nota de estado
+
+- `move-to-position` ahora aborta con errores explicitos etiquetados como `hazard`, `stuck` o `timeout`.
+- La navegacion corta detecta lava inmediata, caidas por encima de un umbral simple, dano repetido y exposicion peligrosa al agua o aire bajo.
+- `harvest-wood` y `mine-cobblestone` filtran targets y posiciones de trabajo obviamente peligrosas antes de insistir en una ruta.
+- El alcance sigue siendo deliberadamente acotado a movimiento corto y reactivo; no hay pathfinding global ni estrategias avanzadas de escape.
 
 ## Habilidad 5: Supervivencia basica
 
