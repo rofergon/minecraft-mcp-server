@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z, ZodError, ZodRawShape, ZodType } from "zod";
 import type { ConnectionCheckResult } from './backend.js';
 
@@ -8,6 +8,7 @@ interface ConnectionLike {
 
 type McpResponse = {
   content: { type: "text"; text: string }[];
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
   [key: string]: unknown;
 };
@@ -24,8 +25,8 @@ export class ToolFactory {
     schema: Record<string, unknown>,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     executor: (args: any) => Promise<McpResponse>
-  ): void {
-    this.server.tool(name, description, schema, async (args: unknown): Promise<McpResponse> => {
+  ): RegisteredTool {
+    return this.server.tool(name, description, schema, async (args: unknown): Promise<McpResponse> => {
       const connectionCheck = await this.connection.checkConnectionAndReconnect();
 
       if (!connectionCheck.connected) {
@@ -49,6 +50,18 @@ export class ToolFactory {
   createResponse(text: string): McpResponse {
     return {
       content: [{ type: "text", text }]
+    };
+  }
+
+  createStructuredResponse(text: string, data: unknown): McpResponse {
+    const structuredContent = this.normalizeStructuredContent(data);
+    if (!structuredContent) {
+      return this.createResponse(text);
+    }
+
+    return {
+      content: [{ type: "text", text }],
+      structuredContent
     };
   }
 
@@ -89,5 +102,21 @@ export class ToolFactory {
       .join('; ');
 
     return `Invalid tool arguments: ${details}`;
+  }
+
+  private normalizeStructuredContent(data: unknown): Record<string, unknown> | undefined {
+    if (data === null || typeof data === 'undefined') {
+      return undefined;
+    }
+
+    if (Array.isArray(data)) {
+      return { data };
+    }
+
+    if (typeof data === 'object') {
+      return data as Record<string, unknown>;
+    }
+
+    return { value: data };
   }
 }

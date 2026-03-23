@@ -1,7 +1,11 @@
 import test from 'ava';
 import net from 'node:net';
+import sinon from 'sinon';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ClientBridgeBackend } from '../src/backends/client-bridge-backend.js';
 import type { ServerConfig } from '../src/config.js';
+import { ToolFactory } from '../src/tool-factory.js';
+import { MessageStore } from '../src/message-store.js';
 
 function listen(server: net.Server, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -16,6 +20,23 @@ function close(server: net.Server): Promise<void> {
       if (error) reject(error);
       else resolve();
     });
+  });
+}
+
+function deliverCapabilities(
+  backend: ClientBridgeBackend,
+  supportedActions: string[]
+): void {
+  (backend as unknown as {
+    handleMessage: (message: {
+      type: 'capabilities';
+      supportedActions: string[];
+      worldReady: boolean;
+    }) => void;
+  }).handleMessage({
+    type: 'capabilities',
+    supportedActions,
+    worldReady: true
   });
 }
 
@@ -116,4 +137,123 @@ test.serial('client bridge backend completes handshake and performs action', asy
     entities: 1,
     namespaces: ['minecraft']
   });
+});
+
+test('client bridge registers only supported passthrough tools', (t) => {
+  const removedTools: string[] = [];
+  const registeredTools: string[] = [];
+  const mockServer = {
+    tool: sinon.stub().callsFake((name: string) => {
+      registeredTools.push(name);
+      return {
+        remove: () => {
+          removedTools.push(name);
+        }
+      };
+    })
+  } as unknown as McpServer;
+
+  const backend = new ClientBridgeBackend({
+    backend: 'client-bridge',
+    host: 'localhost',
+    port: 25565,
+    username: 'LLMBot',
+    bridgeHost: '127.0.0.1',
+    bridgePort: 25570,
+    bridgeToken: undefined,
+    autoReconnect: false
+  }, {
+    onLog: () => undefined,
+    onChatMessage: () => undefined
+  });
+
+  const factory = new ToolFactory(mockServer, backend);
+  backend.registerTools(factory, new MessageStore());
+
+  t.deepEqual(registeredTools, ['read-chat']);
+
+  deliverCapabilities(backend, ['get-position', 'dig-block']);
+
+  t.deepEqual(registeredTools, ['read-chat', 'get-position', 'dig-block']);
+  t.deepEqual(removedTools, []);
+});
+
+test('client bridge reconciles registered tools when supported actions change', (t) => {
+  const removedTools: string[] = [];
+  const registeredTools: string[] = [];
+  const mockServer = {
+    tool: sinon.stub().callsFake((name: string) => {
+      registeredTools.push(name);
+      return {
+        remove: () => {
+          removedTools.push(name);
+        }
+      };
+    })
+  } as unknown as McpServer;
+
+  const backend = new ClientBridgeBackend({
+    backend: 'client-bridge',
+    host: 'localhost',
+    port: 25565,
+    username: 'LLMBot',
+    bridgeHost: '127.0.0.1',
+    bridgePort: 25570,
+    bridgeToken: undefined,
+    autoReconnect: false
+  }, {
+    onLog: () => undefined,
+    onChatMessage: () => undefined
+  });
+
+  const factory = new ToolFactory(mockServer, backend);
+  backend.registerTools(factory, new MessageStore());
+
+  deliverCapabilities(backend, ['get-position', 'dig-block']);
+  deliverCapabilities(backend, ['move-to-position']);
+
+  t.true(registeredTools.includes('read-chat'));
+  t.true(registeredTools.includes('get-position'));
+  t.true(registeredTools.includes('dig-block'));
+  t.true(registeredTools.includes('move-to-position'));
+  t.deepEqual(removedTools.sort(), ['dig-block', 'get-position']);
+});
+
+test('client bridge passthrough tool forwards structuredContent from action data', async (t) => {
+  const mockServer = {
+    tool: sinon.stub()
+  } as unknown as McpServer;
+
+  const backend = new ClientBridgeBackend({
+    backend: 'client-bridge',
+    host: 'localhost',
+    port: 25565,
+    username: 'LLMBot',
+    bridgeHost: '127.0.0.1',
+    bridgePort: 25570,
+    bridgeToken: undefined,
+    autoReconnect: false
+  }, {
+    onLog: () => undefined,
+    onChatMessage: () => undefined
+  });
+
+  sinon.stub(backend, 'checkConnectionAndReconnect').resolves({ connected: true });
+  sinon.stub(backend, 'performAction').resolves({
+    message: 'Current position: (1, 2, 3)',
+    data: { x: 1, y: 2, z: 3 }
+  });
+
+  const factory = new ToolFactory(mockServer, backend);
+  backend.registerTools(factory, new MessageStore());
+  deliverCapabilities(backend, ['get-position']);
+
+  const toolCalls = (mockServer.tool as sinon.SinonStub).getCalls();
+  const getPositionCall = toolCalls.find((call) => call.args[0] === 'get-position');
+  t.truthy(getPositionCall);
+
+  const executor = getPositionCall!.args[3];
+  const result = await executor({});
+
+  t.deepEqual(result.structuredContent, { x: 1, y: 2, z: 3 });
 });

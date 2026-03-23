@@ -28,6 +28,32 @@ test('createResponse handles empty string', (t) => {
   });
 });
 
+test('createStructuredResponse includes object structuredContent', (t) => {
+  const mockServer = {} as McpServer;
+  const mockConnection = {} as BotConnection;
+  const factory = new ToolFactory(mockServer, mockConnection);
+
+  const response = factory.createStructuredResponse('Test message', { x: 1, y: 2 });
+
+  t.deepEqual(response, {
+    content: [{ type: 'text', text: 'Test message' }],
+    structuredContent: { x: 1, y: 2 }
+  });
+});
+
+test('createStructuredResponse wraps array structuredContent', (t) => {
+  const mockServer = {} as McpServer;
+  const mockConnection = {} as BotConnection;
+  const factory = new ToolFactory(mockServer, mockConnection);
+
+  const response = factory.createStructuredResponse('Items found', [{ id: 'minecraft:stone' }]);
+
+  t.deepEqual(response, {
+    content: [{ type: 'text', text: 'Items found' }],
+    structuredContent: { data: [{ id: 'minecraft:stone' }] }
+  });
+});
+
 test('createErrorResponse with Error object', (t) => {
   const mockServer = {} as McpServer;
   const mockConnection = {} as BotConnection;

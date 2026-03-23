@@ -1,15 +1,16 @@
 import { z } from 'zod';
+import type { RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MessageStore } from '../message-store.js';
 import type { ToolFactory } from '../tool-factory.js';
 import type { ClientBridgeBackend } from '../backends/client-bridge-backend.js';
 
-type ToolSpec = {
+export type ClientBridgeToolSpec = {
   description: string;
   name: string;
   schema: Record<string, unknown>;
 };
 
-const PASSTHROUGH_TOOLS: ToolSpec[] = [
+export const CLIENT_BRIDGE_PASSTHROUGH_TOOLS: ClientBridgeToolSpec[] = [
   {
     name: 'get-position',
     description: 'Get the current position of the bot',
@@ -198,27 +199,26 @@ const PASSTHROUGH_TOOLS: ToolSpec[] = [
   }
 ];
 
-export function registerClientBridgeTools(
+export function registerClientBridgePassthroughTool(
   factory: ToolFactory,
   backend: ClientBridgeBackend,
-  messageStore: MessageStore
-): void {
-  for (const tool of PASSTHROUGH_TOOLS) {
-    if (tool.name === 'read-chat') {
-      continue;
+  tool: ClientBridgeToolSpec
+): RegisteredTool {
+  return factory.registerTool(tool.name, tool.description, tool.schema, async (args) => {
+    const result = await backend.performAction(tool.name, (args as Record<string, unknown>) ?? {});
+    if (result.isError) {
+      return factory.createErrorResponse(result.message);
     }
 
-    factory.registerTool(tool.name, tool.description, tool.schema, async (args) => {
-      const result = await backend.performAction(tool.name, (args as Record<string, unknown>) ?? {});
-      if (result.isError) {
-        return factory.createErrorResponse(result.message);
-      }
+    return factory.createStructuredResponse(result.message, result.data);
+  });
+}
 
-      return factory.createResponse(result.message);
-    });
-  }
-
-  factory.registerTool(
+export function registerClientBridgeReadChatTool(
+  factory: ToolFactory,
+  messageStore: MessageStore
+): RegisteredTool {
+  return factory.registerTool(
     'read-chat',
     'Get recent chat messages from players',
     {
@@ -229,7 +229,7 @@ export function registerClientBridgeTools(
       const messages = messageStore.getRecentMessages(maxCount);
 
       if (messages.length === 0) {
-        return factory.createResponse('No chat messages found');
+        return factory.createStructuredResponse('No chat messages found', { messages: [] });
       }
 
       let output = `Found ${messages.length} chat message(s):\n\n`;
@@ -238,7 +238,10 @@ export function registerClientBridgeTools(
         output += `${index + 1}. ${timestamp} - ${msg.username}: ${msg.content}\n`;
       });
 
-      return factory.createResponse(output);
+      return factory.createStructuredResponse(output, {
+        messages,
+        count: messages.length
+      });
     }
   );
 }

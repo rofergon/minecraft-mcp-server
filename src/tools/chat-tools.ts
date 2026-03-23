@@ -13,7 +13,7 @@ export function registerChatTools(factory: ToolFactory, getBot: () => mineflayer
     async ({ message }) => {
       const bot = getBot();
       bot.chat(message);
-      return factory.createResponse(`Sent message: "${message}"`);
+      return factory.createStructuredResponse(`Sent message: "${message}"`, { message });
     }
   );
 
@@ -28,7 +28,7 @@ export function registerChatTools(factory: ToolFactory, getBot: () => mineflayer
       const messages = messageStore.getRecentMessages(maxCount);
 
       if (messages.length === 0) {
-        return factory.createResponse("No chat messages found");
+        return factory.createStructuredResponse("No chat messages found", { messages: [] });
       }
 
       let output = `Found ${messages.length} chat message(s):\n\n`;
@@ -37,7 +37,10 @@ export function registerChatTools(factory: ToolFactory, getBot: () => mineflayer
         output += `${index + 1}. ${timestamp} - ${msg.username}: ${msg.content}\n`;
       });
 
-      return factory.createResponse(output);
+      return factory.createStructuredResponse(output, {
+        messages,
+        count: messages.length
+      });
     }
   );
 }

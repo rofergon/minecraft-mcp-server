@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "minecraft_mcp_bridge",
+  "version": "${version}",
+  "name": "Minecraft MCP Bridge",
+  "description": "Fabric companion bridge for minecraft-mcp-server.",
+  "authors": [
+    "OpenAI Codex"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.yuniko.minecraftmcp.bridge.MinecraftMcpBridgeMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.21.11",
+    "java": ">=21"
+  }
+}

@@ -8,7 +8,7 @@ export function registerRuntimeCapabilitiesTool(factory: ToolFactory, getBackend
     {},
     async () => {
       const capabilities = await getBackend().getRuntimeCapabilities();
-      return factory.createResponse(JSON.stringify(capabilities, null, 2));
+      return factory.createStructuredResponse(JSON.stringify(capabilities, null, 2), capabilities);
     }
   );
 }

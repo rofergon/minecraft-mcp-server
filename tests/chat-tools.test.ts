@@ -74,6 +74,7 @@ test('send-chat calls bot.chat with message', async (t) => {
 
   t.true((mockBot.chat as sinon.SinonStub).calledOnceWith('Hello world'));
   t.true(result.content[0].text.includes('Hello world'));
+  t.deepEqual(result.structuredContent, { message: 'Hello world' });
 });
 
 test('read-chat returns no messages when empty', async (t) => {
@@ -98,6 +99,7 @@ test('read-chat returns no messages when empty', async (t) => {
   const result = await executor({});
 
   t.true(result.content[0].text.includes('No chat messages found'));
+  t.deepEqual(result.structuredContent, { messages: [] });
 });
 
 test('read-chat returns formatted messages', async (t) => {
@@ -129,6 +131,8 @@ test('read-chat returns formatted messages', async (t) => {
   t.true(result.content[0].text.includes('player2'));
   t.true(result.content[0].text.includes('Hi there'));
   t.true(result.content[0].text.includes('2 chat message'));
+  t.is(result.structuredContent.count, 2);
+  t.true(Array.isArray(result.structuredContent.messages));
 });
 
 test('read-chat respects count parameter', async (t) => {

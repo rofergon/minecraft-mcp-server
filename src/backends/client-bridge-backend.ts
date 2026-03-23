@@ -1,10 +1,11 @@
 import net from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
+import type { RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { BackendCallbacks, BridgeActionResult, ConnectionCheckResult, ConnectionState, GameBackend, RegistrySummary, RuntimeCapabilities } from '../backend.js';
 import type { ServerConfig } from '../config.js';
 import type { MessageStore } from '../message-store.js';
 import type { ToolFactory } from '../tool-factory.js';
-import { registerClientBridgeTools } from '../tools/client-bridge-tools.js';
+import { CLIENT_BRIDGE_PASSTHROUGH_TOOLS, registerClientBridgePassthroughTool, registerClientBridgeReadChatTool } from '../tools/client-bridge-tools.js';
 
 type BridgeMessage =
   | {
@@ -105,6 +106,10 @@ export class ClientBridgeBackend implements GameBackend {
   private worldReady = false;
   private registrySummary?: RegistrySummary;
   private lastError?: string;
+  private toolFactory?: ToolFactory;
+  private messageStore?: MessageStore;
+  private readChatTool?: RegisteredTool;
+  private readonly registeredActionTools = new Map<string, RegisteredTool>();
 
   constructor(config: ServerConfig, callbacks: BackendCallbacks) {
     this.config = config;
@@ -112,7 +117,15 @@ export class ClientBridgeBackend implements GameBackend {
   }
 
   registerTools(factory: ToolFactory, messageStore: MessageStore): void {
-    registerClientBridgeTools(factory, this, messageStore);
+    this.toolFactory = factory;
+    this.messageStore = messageStore;
+
+    if (!this.readChatTool) {
+      this.readChatTool = registerClientBridgeReadChatTool(factory, messageStore);
+    }
+
+    this.syncRegisteredTools();
+    void this.probeAndSyncTools();
   }
 
   async probe(timeoutMs = 750): Promise<boolean> {
@@ -325,6 +338,7 @@ export class ClientBridgeBackend implements GameBackend {
         this.supportedActions = message.supportedActions ?? this.supportedActions;
         this.notes = message.notes ?? this.notes;
         this.worldReady = message.worldReady ?? this.worldReady;
+        this.syncRegisteredTools();
         break;
       case 'session_state':
         this.worldReady = message.worldReady ?? this.worldReady;
@@ -404,5 +418,39 @@ export class ClientBridgeBackend implements GameBackend {
     }
 
     this.socket.write(`${JSON.stringify(payload)}\n`);
+  }
+
+  private async probeAndSyncTools(): Promise<void> {
+    try {
+      await this.probe();
+    } finally {
+      this.syncRegisteredTools();
+    }
+  }
+
+  private syncRegisteredTools(): void {
+    if (!this.toolFactory || !this.messageStore) {
+      return;
+    }
+
+    const supported = new Set(this.supportedActions);
+
+    for (const [name, registeredTool] of this.registeredActionTools) {
+      if (supported.has(name)) {
+        continue;
+      }
+
+      registeredTool.remove();
+      this.registeredActionTools.delete(name);
+    }
+
+    for (const tool of CLIENT_BRIDGE_PASSTHROUGH_TOOLS) {
+      if (!supported.has(tool.name) || this.registeredActionTools.has(tool.name)) {
+        continue;
+      }
+
+      const registeredTool = registerClientBridgePassthroughTool(this.toolFactory, this, tool);
+      this.registeredActionTools.set(tool.name, registeredTool);
+    }
   }
 }
