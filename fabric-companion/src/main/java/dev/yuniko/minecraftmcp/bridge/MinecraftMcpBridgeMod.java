@@ -73,7 +73,10 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor();
     private final ClientThreadExecutor clientThreadExecutor = new ClientThreadExecutor();
+    private final ActionCoordinator actionCoordinator = new ActionCoordinator();
     private final ActionDispatcher actionDispatcher = new ActionDispatcher(new BridgeActionHandler());
+    private final NavigationController navigationController = new NavigationController(clientThreadExecutor, new NavigationHooks());
+    private final TaskServices taskServices = new TaskServices(new TaskHooks());
     private BridgeConfig config;
     private BridgeServer bridgeServer;
     private volatile boolean lastWorldReady = false;
@@ -93,6 +96,17 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             return;
         }
 
+        actionCoordinator.dispatch(
+            executionModeFor(action),
+            () -> executeAction(requestId, action, args),
+            (error) -> sendError(
+                requestId,
+                "Unexpected failure while executing '" + action + "': " + (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage())
+            )
+        );
+    }
+
+    private void executeAction(String requestId, String action, JsonObject args) {
         MinecraftClient client = MinecraftClient.getInstance();
         ClientPlayerEntity player = client.player;
         ClientWorld world = client.world;
@@ -107,16 +121,34 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             case "list-inventory" -> handleListInventory(requestId, player);
             case "find-item" -> handleFindItem(requestId, player, args);
             case "equip-item" -> handleEquipItem(requestId, player, args);
-            case "move-to-position" -> executor.submit(() -> handleMoveToPosition(requestId, args));
-            case "dig-block" -> executor.submit(() -> handleDigBlock(requestId, args));
-            case "harvest-wood" -> executor.submit(() -> handleHarvestWood(requestId, args));
-            case "mine-cobblestone" -> executor.submit(() -> handleMineCobblestone(requestId, args));
+            case "move-to-position" -> handleMoveToPosition(requestId, args);
+            case "dig-block" -> handleDigBlock(requestId, args);
+            case "harvest-wood" -> handleHarvestWood(requestId, args);
+            case "mine-cobblestone" -> handleMineCobblestone(requestId, args);
             case "get-block-info" -> handleGetBlockInfo(requestId, world, args);
             case "find-block" -> handleFindBlock(requestId, player, world, args);
             case "detect-gamemode" -> handleDetectGamemode(requestId, client);
             case "send-chat" -> handleSendChat(requestId, player, args);
             default -> sendError(requestId, "Action '" + action + "' is not yet implemented.");
         }
+    }
+
+    private ActionCoordinator.Mode executionModeFor(String action) {
+        return switch (action) {
+            case "get-position",
+                "list-inventory",
+                "find-item",
+                "get-block-info",
+                "find-block",
+                "detect-gamemode" -> ActionCoordinator.Mode.READ_ONLY;
+            case "equip-item",
+                "move-to-position",
+                "dig-block",
+                "harvest-wood",
+                "mine-cobblestone",
+                "send-chat" -> ActionCoordinator.Mode.EXCLUSIVE;
+            default -> ActionCoordinator.Mode.READ_ONLY;
+        };
     }
 
     private void handleGetPosition(String requestId, ClientPlayerEntity player) {
@@ -260,7 +292,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         try {
-            MoveResult result = moveToPositionSync(new Vec3d(x + 0.5D, y, z + 0.5D), range, timeoutMs);
+            NavigationController.MoveResult result = navigationController.moveToPositionSync(new Vec3d(x + 0.5D, y, z + 0.5D), range, timeoutMs);
             JsonObject data = new JsonObject();
             data.addProperty("x", result.position().x);
             data.addProperty("y", result.position().y);
@@ -306,7 +338,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         try {
-            HarvestWoodResult result = harvestWoodSync(amount, preferredType, maxRadius, reportEvery);
+            TaskServices.HarvestWoodResult result = taskServices.harvestWoodSync(amount, preferredType, maxRadius, reportEvery);
             JsonObject data = new JsonObject();
             data.addProperty("processed", result.processed());
             data.addProperty("collected", result.collected());
@@ -336,7 +368,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         try {
-            MineCobblestoneResult result = mineCobblestoneSync(amount, maxRadius, reportEvery);
+            TaskServices.MineCobblestoneResult result = taskServices.mineCobblestoneSync(amount, maxRadius, reportEvery);
             JsonObject data = new JsonObject();
             data.addProperty("processed", result.processed());
             data.addProperty("collected", result.collected());
@@ -514,52 +546,6 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return client.player != null && client.world != null;
     }
 
-    private MoveResult moveToPositionSync(Vec3d target, double range, long timeoutMs) throws Exception {
-        return moveToPositionSync(target, range, timeoutMs, true, false);
-    }
-
-    private MoveResult moveToPositionSync(Vec3d target, double range, long timeoutMs, boolean allowJump) throws Exception {
-        return moveToPositionSync(target, range, timeoutMs, allowJump, false);
-    }
-
-    private MoveResult moveToPositionSync(Vec3d target, double range, long timeoutMs, boolean allowJump, boolean clearSoftObstructions) throws Exception {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        StuckTracker stuckTracker = new StuckTracker();
-
-        try {
-            while (System.currentTimeMillis() < deadline) {
-                MoveTickResult tick = callOnClientThread(() -> updateNavigationTick(target, range, allowJump, clearSoftObstructions, stuckTracker));
-                if (tick.arrived()) {
-                    return new MoveResult(tick.position());
-                }
-
-                if (tick.state() == NavigationState.STUCK_RECOVERY && stuckTracker.recoveryAttempts() > 4) {
-                    throw new IllegalStateException(
-                        "Move failed near (" +
-                            Math.floor(tick.position().x) + ", " +
-                            Math.floor(tick.position().y) + ", " +
-                            Math.floor(tick.position().z) + "): " + tick.status()
-                    );
-                }
-
-                Thread.sleep(50L);
-            }
-
-            MoveTickResult current = callOnClientThread(() -> currentMoveTick(target, range));
-            throw new IllegalStateException(
-                "Move timed out after " + timeoutMs + "ms. Current position: (" +
-                    Math.floor(current.position().x) + ", " +
-                    Math.floor(current.position().y) + ", " +
-                    Math.floor(current.position().z) + "). State: " + current.state() + ". " + current.status()
-            );
-        } finally {
-            callOnClientThread(() -> {
-                stopMovement(MinecraftClient.getInstance());
-                return null;
-            });
-        }
-    }
-
     private String digBlockSync(BlockPos pos) throws Exception {
         MinecraftClient client = MinecraftClient.getInstance();
         String initialBlock = callOnClientThread(() -> {
@@ -600,7 +586,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                     "No valid digging position found for block at (" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")"
                 );
             }
-            moveToPositionSync(candidate.standPosition(), candidate.range(), 15000L, true, true);
+            navigationController.moveToPositionSync(candidate.standPosition(), candidate.range(), 15000L, true, true);
             break;
         }
 
@@ -625,7 +611,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                             "Lost reachability to block at (" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ") and found no alternative position"
                         );
                     }
-                    moveToPositionSync(candidate.standPosition(), candidate.range(), 8000L, true, true);
+                    navigationController.moveToPositionSync(candidate.standPosition(), candidate.range(), 8000L, true, true);
                     continue;
                 }
 
@@ -640,400 +626,6 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                 return null;
             });
         }
-    }
-
-    private HarvestWoodResult harvestWoodSync(int amount, String preferredType, int maxRadius, int reportEvery) throws Exception {
-        String normalizedType = normalizeHarvestType(preferredType);
-        int startingCount = callOnClientThread(() -> countMatchingLogsInInventory(normalizedType));
-        int processed = 0;
-        int lastCollected = 0;
-        Set<BlockPos> ignoredTargets = new HashSet<>();
-
-        while (lastCollected < amount) {
-            HarvestTarget target = callOnClientThread(() -> findNearestHarvestTarget(normalizedType, maxRadius, ignoredTargets));
-            if (target == null) {
-                break;
-            }
-
-            try {
-                digBlockSync(target.position());
-                collectDropsNearSync(target.position());
-                processed++;
-                lastCollected = Math.max(0, callOnClientThread(() -> countMatchingLogsInInventory(normalizedType)) - startingCount);
-                ignoredTargets.clear();
-
-                if (processed % reportEvery == 0 || lastCollected >= amount) {
-                    sendJobProgress("harvest-wood", "Progress: " + lastCollected + "/" + amount + " logs collected after processing " + processed + " block(s).");
-                }
-            } catch (Exception error) {
-                ignoredTargets.add(target.position());
-                if (ignoredTargets.size() >= 24) {
-                    break;
-                }
-            }
-        }
-
-        int collected = Math.max(0, callOnClientThread(() -> countMatchingLogsInInventory(normalizedType)) - startingCount);
-        BlockPos finalPosition = callOnClientThread(this::currentPlayerBlockPos);
-        if (collected < amount) {
-            throw new IllegalStateException(
-                "Stopped after collecting " + collected + "/" + amount + " log(s). No more valid targets were found within " + maxRadius + " blocks."
-            );
-        }
-
-        return new HarvestWoodResult(amount, collected, processed, normalizedType, finalPosition);
-    }
-
-    private MineCobblestoneResult mineCobblestoneSync(int amount, int maxRadius, int reportEvery) throws Exception {
-        Set<String> targetBlocks = Set.of("stone", "cobblestone");
-        String targetItem = "cobblestone";
-        int startingCount = callOnClientThread(() -> countMatchingInventoryItems(targetItem));
-        int processed = 0;
-        int lastCollected = 0;
-        Set<BlockPos> ignoredTargets = new HashSet<>();
-
-        while (lastCollected < amount) {
-            MineTarget target = callOnClientThread(() -> findNearestMineTarget(targetBlocks, maxRadius, ignoredTargets));
-            if (target == null) {
-                break;
-            }
-
-            try {
-                digBlockSync(target.position());
-                collectDropsNearSync(target.position());
-                processed++;
-                lastCollected = Math.max(0, callOnClientThread(() -> countMatchingInventoryItems(targetItem)) - startingCount);
-                ignoredTargets.clear();
-
-                if (processed % reportEvery == 0 || lastCollected >= amount) {
-                    sendJobProgress(
-                        "mine-cobblestone",
-                        "Progress: " + lastCollected + "/" + amount + " cobblestone collected after processing " + processed + " block(s)."
-                    );
-                }
-            } catch (Exception error) {
-                ignoredTargets.add(target.position());
-                if (ignoredTargets.size() >= 24) {
-                    break;
-                }
-            }
-        }
-
-        int collected = Math.max(0, callOnClientThread(() -> countMatchingInventoryItems(targetItem)) - startingCount);
-        BlockPos finalPosition = callOnClientThread(this::currentPlayerBlockPos);
-        if (collected < amount) {
-            throw new IllegalStateException(
-                "Stopped after collecting " + collected + "/" + amount + " cobblestone. No more valid stone or cobblestone targets were found within " + maxRadius + " blocks."
-            );
-        }
-
-        return new MineCobblestoneResult(amount, collected, processed, targetItem, finalPosition);
-    }
-
-    private void collectDropsNearSync(BlockPos pos) throws Exception {
-        int targetY = Math.max(0, pos.getY() - 1);
-        moveToPositionSync(new Vec3d(pos.getX() + 0.5D, targetY, pos.getZ() + 0.5D), 1.35D, 8000L, true, true);
-        Thread.sleep(200L);
-    }
-
-    private HarvestTarget findNearestHarvestTarget(String preferredType, int maxRadius, Set<BlockPos> ignoredTargets) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        ClientWorld world = client.world;
-        if (player == null || world == null) {
-            return null;
-        }
-
-        BlockPos origin = BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
-        HarvestTarget bestTarget = null;
-        double bestScore = Double.MAX_VALUE;
-        int verticalRadius = Math.min(12, maxRadius);
-
-        for (int dx = -maxRadius; dx <= maxRadius; dx++) {
-            for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
-                for (int dz = -maxRadius; dz <= maxRadius; dz++) {
-                    BlockPos candidate = origin.add(dx, dy, dz);
-                    if (ignoredTargets.contains(candidate)) {
-                        continue;
-                    }
-
-                    BlockState state = world.getBlockState(candidate);
-                    Identifier id = Registries.BLOCK.getId(state.getBlock());
-                    if (!matchesHarvestType(id.toString(), preferredType)) {
-                        continue;
-                    }
-
-                    boolean reachableNow = isBlockReachableNow(candidate).reachable();
-                    boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
-                    if (!reachableNow && !canReposition) {
-                        continue;
-                    }
-
-                    double horizontalDistance = Math.pow(candidate.getX() - origin.getX(), 2) + Math.pow(candidate.getZ() - origin.getZ(), 2);
-                    double verticalPenalty = Math.max(0, candidate.getY() - origin.getY()) * 5.0D + Math.abs(candidate.getY() - origin.getY()) * 1.5D;
-                    double score = horizontalDistance + verticalPenalty;
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestTarget = new HarvestTarget(candidate, id.toString());
-                    }
-                }
-            }
-        }
-
-        return bestTarget;
-    }
-
-    private int countMatchingLogsInInventory(String preferredType) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        if (player == null) {
-            return 0;
-        }
-
-        int total = 0;
-        for (int slot = 0; slot < player.getInventory().size(); slot++) {
-            ItemStack stack = player.getInventory().getStack(slot);
-            if (stack.isEmpty()) {
-                continue;
-            }
-
-            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
-            if (matchesHarvestType(itemId, preferredType)) {
-                total += stack.getCount();
-            }
-        }
-
-        return total;
-    }
-
-    private MineTarget findNearestMineTarget(Set<String> blockTypes, int maxRadius, Set<BlockPos> ignoredTargets) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        ClientWorld world = client.world;
-        if (player == null || world == null) {
-            return null;
-        }
-
-        BlockPos origin = BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
-        MineTarget bestTarget = null;
-        double bestScore = Double.MAX_VALUE;
-        int verticalRadius = Math.min(16, maxRadius);
-
-        for (int dx = -maxRadius; dx <= maxRadius; dx++) {
-            for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
-                for (int dz = -maxRadius; dz <= maxRadius; dz++) {
-                    BlockPos candidate = origin.add(dx, dy, dz);
-                    if (ignoredTargets.contains(candidate)) {
-                        continue;
-                    }
-
-                    BlockState state = world.getBlockState(candidate);
-                    Identifier id = Registries.BLOCK.getId(state.getBlock());
-                    if (!matchesAnyExactBlockType(id.toString(), blockTypes)) {
-                        continue;
-                    }
-
-                    boolean reachableNow = isBlockReachableNow(candidate).reachable();
-                    boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
-                    BlockPos obstruction = (!reachableNow && !canReposition) ? findClearableDigObstruction(candidate) : null;
-                    if (!reachableNow && !canReposition && obstruction == null) {
-                        continue;
-                    }
-
-                    double horizontalDistance = Math.pow(candidate.getX() - origin.getX(), 2) + Math.pow(candidate.getZ() - origin.getZ(), 2);
-                    double verticalPenalty = Math.max(0, candidate.getY() - origin.getY()) * 6.0D + Math.abs(candidate.getY() - origin.getY()) * 2.0D;
-                    double obstructionPenalty = obstruction != null ? 3.0D : 0.0D;
-                    double score = horizontalDistance + verticalPenalty + obstructionPenalty;
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestTarget = new MineTarget(candidate, id.toString());
-                    }
-                }
-            }
-        }
-
-        return bestTarget;
-    }
-
-    private int countMatchingInventoryItems(String targetItem) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        if (player == null) {
-            return 0;
-        }
-
-        int total = 0;
-        for (int slot = 0; slot < player.getInventory().size(); slot++) {
-            ItemStack stack = player.getInventory().getStack(slot);
-            if (stack.isEmpty()) {
-                continue;
-            }
-
-            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
-            if (matchesExactBlockType(itemId, targetItem)) {
-                total += stack.getCount();
-            }
-        }
-
-        return total;
-    }
-
-    private String normalizeHarvestType(String preferredType) {
-        if (preferredType == null || preferredType.isBlank()) {
-            return null;
-        }
-
-        String normalized = preferredType.toLowerCase();
-        if (normalized.contains(":")) {
-            normalized = normalized.substring(normalized.indexOf(':') + 1);
-        }
-
-        if (!normalized.endsWith("_log")) {
-            normalized = normalized + "_log";
-        }
-
-        return normalized;
-    }
-
-    private boolean matchesHarvestType(String id, String preferredType) {
-        String normalized = id.toLowerCase();
-        int separatorIndex = normalized.indexOf(':');
-        String localId = separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
-        if (preferredType != null) {
-            return localId.equals(preferredType);
-        }
-
-        return localId.endsWith("_log");
-    }
-
-    private boolean matchesExactBlockType(String id, String targetType) {
-        String normalized = id.toLowerCase();
-        int separatorIndex = normalized.indexOf(':');
-        String localId = separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
-        return localId.equals(targetType.toLowerCase());
-    }
-
-    private boolean matchesAnyExactBlockType(String id, Set<String> targetTypes) {
-        for (String targetType : targetTypes) {
-            if (matchesExactBlockType(id, targetType)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private BlockPos currentPlayerBlockPos() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        if (player == null) {
-            return BlockPos.ORIGIN;
-        }
-
-        return BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
-    }
-
-    private MoveTickResult updateNavigationTick(Vec3d target, double range, boolean allowJump, boolean clearSoftObstructions, StuckTracker stuckTracker) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        ClientWorld world = client.world;
-        if (player == null || world == null) {
-            return new MoveTickResult(true, Vec3d.ZERO, NavigationState.MOVING_DIRECT, "World not ready");
-        }
-
-        Vec3d current = new Vec3d(player.getX(), player.getY(), player.getZ());
-        double dx = target.x - current.x;
-        double dz = target.z - current.z;
-        double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-        boolean arrived = horizontalDistance <= range && Math.abs(target.y - current.y) <= 1.5D;
-        if (arrived) {
-            stopMovement(client);
-            return new MoveTickResult(true, current, NavigationState.MOVING_DIRECT, "Arrived");
-        }
-
-        double totalDistance = current.distanceTo(target);
-        stuckTracker.record(current, totalDistance);
-
-        if (stuckTracker.isRecovering()) {
-            float recoveryYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
-            player.setYaw(recoveryYaw);
-            player.setHeadYaw(recoveryYaw);
-            player.setBodyYaw(recoveryYaw);
-            client.options.forwardKey.setPressed(true);
-            client.options.backKey.setPressed(false);
-            client.options.leftKey.setPressed(stuckTracker.recoverLeft());
-            client.options.rightKey.setPressed(!stuckTracker.recoverLeft());
-            client.options.sprintKey.setPressed(false);
-            client.options.jumpKey.setPressed(false);
-            stuckTracker.advanceRecovery();
-            return new MoveTickResult(false, current, NavigationState.STUCK_RECOVERY, "Recovering from obstacle");
-        }
-
-        BlockPos persistentObstruction = stuckTracker.activeObstruction();
-        if (persistentObstruction != null) {
-            if (!isClearableFoliage(world, persistentObstruction)) {
-                stuckTracker.clearObstruction();
-                stopDigging(client);
-            } else {
-                stopMovement(client);
-                DigTickResult clearTick = updateDigTick(persistentObstruction);
-                if (!clearTick.blockPresent()) {
-                    stuckTracker.clearObstruction();
-                    stopDigging(client);
-                }
-                return new MoveTickResult(false, current, NavigationState.DIGGING, "Clearing obstructing block");
-            }
-        }
-
-        boolean stepUp = allowJump && isStepUpPossible(player, world, target);
-        boolean blocked = player.horizontalCollision || isObstructedAhead(player, world, target);
-        BlockPos clearableObstruction = clearSoftObstructions ? findClearableObstructionAhead(player, world, target) : null;
-        if (clearableObstruction != null) {
-            stuckTracker.setObstruction(clearableObstruction);
-            stopMovement(client);
-            DigTickResult clearTick = updateDigTick(clearableObstruction);
-            if (!clearTick.blockPresent()) {
-                stuckTracker.clearObstruction();
-                stopDigging(client);
-            }
-            return new MoveTickResult(false, current, NavigationState.DIGGING, "Clearing obstructing block");
-        }
-
-        if (stuckTracker.shouldStartRecovery(blocked)) {
-            stopMovement(client);
-            stuckTracker.startRecovery();
-            return new MoveTickResult(false, current, NavigationState.STUCK_RECOVERY, "Blocked without progress");
-        }
-
-        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
-        player.setYaw(yaw);
-        player.setHeadYaw(yaw);
-        player.setBodyYaw(yaw);
-
-        client.options.forwardKey.setPressed(true);
-        client.options.backKey.setPressed(false);
-        client.options.leftKey.setPressed(false);
-        client.options.rightKey.setPressed(false);
-        client.options.sprintKey.setPressed(horizontalDistance > 4.0D && !stepUp);
-        client.options.jumpKey.setPressed(stepUp);
-
-        NavigationState state = stepUp ? NavigationState.STEP_UP_ATTEMPT : NavigationState.MOVING_DIRECT;
-        String status = stepUp ? "Stepping up over obstacle" : "Moving directly";
-        return new MoveTickResult(false, current, state, status);
-    }
-
-    private MoveTickResult currentMoveTick(Vec3d target, double range) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        ClientPlayerEntity player = client.player;
-        if (player == null) {
-            return new MoveTickResult(true, Vec3d.ZERO, NavigationState.MOVING_DIRECT, "Player unavailable");
-        }
-
-        Vec3d current = new Vec3d(player.getX(), player.getY(), player.getZ());
-        double dx = target.x - current.x;
-        double dz = target.z - current.z;
-        double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-        boolean arrived = horizontalDistance <= range && Math.abs(target.y - current.y) <= 1.5D;
-        return new MoveTickResult(arrived, current, NavigationState.MOVING_DIRECT, arrived ? "Arrived" : "Awaiting progress");
     }
 
     private DigTickResult updateDigTick(BlockPos pos) {
@@ -1167,66 +759,6 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return !world.getBlockState(pos).getCollisionShape(world, pos).isEmpty();
     }
 
-    private boolean isStepUpPossible(ClientPlayerEntity player, ClientWorld world, Vec3d target) {
-        Vec3d direction = new Vec3d(target.x - player.getX(), 0.0D, target.z - player.getZ());
-        if (direction.lengthSquared() < 1.0E-4D) {
-            return false;
-        }
-
-        Vec3d normalized = direction.normalize().multiply(0.7D);
-        BlockPos aheadFeet = BlockPos.ofFloored(player.getX() + normalized.x, player.getY(), player.getZ() + normalized.z);
-        BlockPos aheadHead = aheadFeet.up();
-        if (isSpaceClear(world, aheadFeet) && isSpaceClear(world, aheadHead)) {
-            return false;
-        }
-
-        BlockPos stepFeet = aheadFeet.up();
-        return isSolidGround(world, aheadFeet)
-            && isSpaceClear(world, stepFeet)
-            && isSpaceClear(world, stepFeet.up());
-    }
-
-    private boolean isObstructedAhead(ClientPlayerEntity player, ClientWorld world, Vec3d target) {
-        Vec3d direction = new Vec3d(target.x - player.getX(), 0.0D, target.z - player.getZ());
-        if (direction.lengthSquared() < 1.0E-4D) {
-            return false;
-        }
-
-        Vec3d normalized = direction.normalize().multiply(0.65D);
-        BlockPos aheadFeet = BlockPos.ofFloored(player.getX() + normalized.x, player.getY(), player.getZ() + normalized.z);
-        BlockPos aheadHead = aheadFeet.up();
-        return !isSpaceClear(world, aheadFeet) || !isSpaceClear(world, aheadHead);
-    }
-
-    private BlockPos findClearableObstructionAhead(ClientPlayerEntity player, ClientWorld world, Vec3d target) {
-        Vec3d direction = new Vec3d(target.x - player.getX(), 0.0D, target.z - player.getZ());
-        if (direction.lengthSquared() < 1.0E-4D) {
-            return null;
-        }
-
-        Vec3d forward = direction.normalize();
-        Vec3d lateral = new Vec3d(-forward.z, 0.0D, forward.x);
-        double[] distances = new double[] { 0.35D, 0.65D, 0.95D, 1.25D };
-        double[] heights = new double[] { 0.0D, 1.0D, 2.0D };
-        double[] lateralOffsets = new double[] { 0.0D, -0.35D, 0.35D };
-
-        for (double distance : distances) {
-            for (double height : heights) {
-                for (double sideOffset : lateralOffsets) {
-                    Vec3d sample = new Vec3d(player.getX(), player.getY() + height, player.getZ())
-                        .add(forward.multiply(distance))
-                        .add(lateral.multiply(sideOffset));
-                    BlockPos candidate = BlockPos.ofFloored(sample);
-                    if (isClearableFoliage(world, candidate) && isBlockReachableNow(candidate).reachable()) {
-                        return candidate;
-                    }
-                }
-            }
-        }
-
-        return null;
-    }
-
     private boolean isClearableFoliage(ClientWorld world, BlockPos pos) {
         BlockState state = world.getBlockState(pos);
         return !state.isAir() && state.isIn(BlockTags.LEAVES);
@@ -1353,101 +885,10 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
     }
 
-    private enum NavigationState {
-        MOVING_DIRECT,
-        STEP_UP_ATTEMPT,
-        STUCK_RECOVERY,
-        DIGGING
-    }
-
-    private static final class StuckTracker {
-        private static final long STUCK_THRESHOLD_MS = 900L;
-        private static final int RECOVERY_TICKS = 8;
-        private static final double MIN_PROGRESS_DISTANCE = 0.12D;
-
-        private Vec3d lastPosition;
-        private double bestDistance = Double.MAX_VALUE;
-        private long lastProgressAt = System.currentTimeMillis();
-        private int recoveryTicksRemaining;
-        private int recoveryAttempts;
-        private boolean recoverLeft = true;
-        private BlockPos activeObstruction;
-
-        void record(Vec3d current, double distanceToTarget) {
-            long now = System.currentTimeMillis();
-            boolean moved = lastPosition == null || current.distanceTo(lastPosition) >= MIN_PROGRESS_DISTANCE;
-            boolean gotCloser = distanceToTarget < (bestDistance - 0.08D);
-            if (moved || gotCloser) {
-                lastPosition = current;
-                bestDistance = Math.min(bestDistance, distanceToTarget);
-                lastProgressAt = now;
-            }
-        }
-
-        boolean shouldStartRecovery(boolean blocked) {
-            return blocked && !isRecovering() && (System.currentTimeMillis() - lastProgressAt) >= STUCK_THRESHOLD_MS;
-        }
-
-        void startRecovery() {
-            recoveryTicksRemaining = RECOVERY_TICKS;
-            recoveryAttempts++;
-            recoverLeft = !recoverLeft;
-            lastProgressAt = System.currentTimeMillis();
-        }
-
-        void advanceRecovery() {
-            if (recoveryTicksRemaining > 0) {
-                recoveryTicksRemaining--;
-            }
-        }
-
-        boolean isRecovering() {
-            return recoveryTicksRemaining > 0;
-        }
-
-        boolean recoverLeft() {
-            return recoverLeft;
-        }
-
-        int recoveryAttempts() {
-            return recoveryAttempts;
-        }
-
-        BlockPos activeObstruction() {
-            return activeObstruction;
-        }
-
-        void setObstruction(BlockPos obstruction) {
-            activeObstruction = obstruction;
-        }
-
-        void clearObstruction() {
-            activeObstruction = null;
-        }
-    }
-
-    private record MoveTickResult(boolean arrived, Vec3d position, NavigationState state, String status) {
-    }
-
-    private record MoveResult(Vec3d position) {
-    }
-
     private record DigTickResult(boolean blockPresent, boolean needsReposition) {
     }
 
     private record DigCandidate(BlockPos feetPos, Vec3d standPosition, double score, double range) {
-    }
-
-    private record HarvestTarget(BlockPos position, String blockId) {
-    }
-
-    private record HarvestWoodResult(int requested, int collected, int processed, String filter, BlockPos position) {
-    }
-
-    private record MineTarget(BlockPos position, String blockId) {
-    }
-
-    private record MineCobblestoneResult(int requested, int collected, int processed, String block, BlockPos position) {
     }
 
     private record ReachabilityResult(boolean reachable, Direction face, Vec3d aimPoint, double distanceSq, String reason) {
@@ -1501,6 +942,60 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         @Override
         public boolean isTokenValid(JsonObject helloMessage) {
             return MinecraftMcpBridgeMod.this.isTokenValid(helloMessage);
+        }
+    }
+
+    private final class NavigationHooks implements NavigationController.Hooks {
+        @Override
+        public boolean isBlockReachable(BlockPos pos) {
+            return isBlockReachableNow(pos).reachable();
+        }
+
+        @Override
+        public boolean tickClearObstruction(BlockPos pos) {
+            return updateDigTick(pos).blockPresent();
+        }
+
+        @Override
+        public boolean isClearableFoliage(ClientWorld world, BlockPos pos) {
+            return MinecraftMcpBridgeMod.this.isClearableFoliage(world, pos);
+        }
+
+        @Override
+        public void stopDigging(MinecraftClient client) {
+            MinecraftMcpBridgeMod.this.stopDigging(client);
+        }
+    }
+
+    private final class TaskHooks implements TaskServices.Hooks {
+        @Override
+        public void digBlockSync(BlockPos pos) throws Exception {
+            MinecraftMcpBridgeMod.this.digBlockSync(pos);
+        }
+
+        @Override
+        public void moveToPosition(Vec3d target, double range, long timeoutMs, boolean allowJump, boolean clearSoftObstructions) throws Exception {
+            navigationController.moveToPositionSync(target, range, timeoutMs, allowJump, clearSoftObstructions);
+        }
+
+        @Override
+        public boolean isDigReachable(BlockPos pos) {
+            return isBlockReachableNow(pos).reachable();
+        }
+
+        @Override
+        public boolean canRepositionForDig(BlockPos pos) {
+            return selectBestDigCandidate(findDigCandidates(pos)) != null;
+        }
+
+        @Override
+        public boolean hasClearableDigObstruction(BlockPos pos) {
+            return findClearableDigObstruction(pos) != null;
+        }
+
+        @Override
+        public void sendJobProgress(String channel, String message) {
+            MinecraftMcpBridgeMod.this.sendJobProgress(channel, message);
         }
     }
 }
