@@ -23,6 +23,7 @@ The mod currently supports these actions end-to-end:
 - `move-to-position`
 - `dig-block`
 - `harvest-wood`
+- `mine-cobblestone`
 - `get-block-info`
 - `find-block`
 - `detect-gamemode`
@@ -32,6 +33,8 @@ The mod currently supports these actions end-to-end:
 
 `harvest-wood` is the first higher-level autonomous job implemented in the Fabric bridge.
 
+`mine-cobblestone` follows the same pattern for short-range automated mining.
+
 Current behavior:
 
 - Searches nearby logs, optionally filtered by type such as `oak_log`
@@ -39,6 +42,7 @@ Current behavior:
 - Avoids the previous infinite-jump behavior on elevated logs
 - Clears obstructing leaves in front of the player when they block access to the trunk
 - Sends periodic progress updates through `chat_event`
+- Mines nearby `cobblestone` blocks autonomously and reports progress in batches
 
 This keeps long harvesting runs inside the mod so the MCP agent does not need to spend tokens micromanaging every single block.
 
