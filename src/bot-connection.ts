@@ -154,10 +154,7 @@ export class BotConnection {
   async checkConnectionAndReconnect(): Promise<{ connected: boolean; message?: string }> {
     const currentState = this.state;
 
-    if (currentState === 'disconnected') {
-      this.attemptReconnect();
-
-      const maxWaitTime = this.reconnectDelayMs + 5000;
+    const waitForConnected = async (maxWaitTime: number) => {
       const pollInterval = 100;
       const startTime = Date.now();
 
@@ -167,6 +164,16 @@ export class BotConnection {
         }
         await new Promise(resolve => setTimeout(resolve, pollInterval));
       }
+
+      return { connected: false };
+    };
+
+    if (currentState === 'disconnected') {
+      this.attemptReconnect();
+
+      const maxWaitTime = this.reconnectDelayMs + 5000;
+      const waitResult = await waitForConnected(maxWaitTime);
+      if (waitResult.connected) return waitResult;
 
       const errorMessage =
         `Cannot connect to Minecraft server at ${this.config.host}:${this.config.port}\n\n` +
@@ -180,7 +187,9 @@ export class BotConnection {
     }
 
     if (currentState === 'connecting') {
-      return { connected: false, message: 'Bot is connecting to the Minecraft server. Please wait a moment and try again.' };
+      const waitResult = await waitForConnected(15000);
+      if (waitResult.connected) return waitResult;
+      return { connected: false, message: 'Bot is still connecting to the Minecraft server. Please wait a moment and try again.' };
     }
 
     return { connected: true };

@@ -7,9 +7,13 @@ test('parseConfig returns default values', (t) => {
   
   const config = parseConfig();
   
+  t.is(config.backend, 'auto');
   t.is(config.host, 'localhost');
   t.is(config.port, 25565);
   t.is(config.username, 'LLMBot');
+  t.is(config.bridgeHost, '127.0.0.1');
+  t.is(config.bridgePort, 25570);
+  t.true(config.autoReconnect);
   
   process.argv = originalArgv;
 });
@@ -55,13 +59,37 @@ test('parseConfig parses custom username', (t) => {
 
 test('parseConfig parses all custom options', (t) => {
   const originalArgv = process.argv;
-  process.argv = ['node', 'script.js', '--host', 'server.net', '--port', '9999', '--username', 'TestBot'];
+  process.argv = [
+    'node',
+    'script.js',
+    '--backend',
+    'client-bridge',
+    '--host',
+    'server.net',
+    '--port',
+    '9999',
+    '--username',
+    'TestBot',
+    '--bridge-host',
+    '127.0.0.42',
+    '--bridge-port',
+    '29999',
+    '--bridge-token',
+    'secret',
+    '--auto-reconnect',
+    'false'
+  ];
   
   const config = parseConfig();
   
+  t.is(config.backend, 'client-bridge');
   t.is(config.host, 'server.net');
   t.is(config.port, 9999);
   t.is(config.username, 'TestBot');
+  t.is(config.bridgeHost, '127.0.0.42');
+  t.is(config.bridgePort, 29999);
+  t.is(config.bridgeToken, 'secret');
+  t.false(config.autoReconnect);
   
   process.argv = originalArgv;
 });

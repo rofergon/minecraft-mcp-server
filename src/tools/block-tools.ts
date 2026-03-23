@@ -98,7 +98,9 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
       }
 
       if (!bot.canDigBlock(block) || !bot.canSeeBlock(block)) {
-        const goal = new goals.GoalNear(x, y, z, 2);
+        const currentY = Math.floor(bot.entity.position.y);
+        const goalY = block.position.y > currentY ? currentY : y;
+        const goal = new goals.GoalNear(x, goalY, z, 1);
         await bot.pathfinder.goto(goal);
       }
 

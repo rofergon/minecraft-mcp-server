@@ -5,18 +5,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { setupStdioFiltering } from './stdio-filter.js';
 import { log } from './logger.js';
 import { parseConfig } from './config.js';
-import { BotConnection } from './bot-connection.js';
+import type { BackendCallbacks, GameBackend } from './backend.js';
 import { ToolFactory } from './tool-factory.js';
 import { MessageStore } from './message-store.js';
-import { registerPositionTools } from './tools/position-tools.js';
-import { registerInventoryTools } from './tools/inventory-tools.js';
-import { registerBlockTools } from './tools/block-tools.js';
-import { registerEntityTools } from './tools/entity-tools.js';
-import { registerChatTools } from './tools/chat-tools.js';
-import { registerFlightTools } from './tools/flight-tools.js';
-import { registerGameStateTools } from './tools/gamestate-tools.js';
-import { registerCraftingTools } from './tools/crafting-tools.js';
-import { registerFurnaceTools } from './tools/furnace-tools.js';
+import { MineflayerBackend } from './backends/mineflayer-backend.js';
+import { ClientBridgeBackend } from './backends/client-bridge-backend.js';
+import { registerRuntimeCapabilitiesTool } from './tools/runtime-capabilities-tool.js';
 
 setupStdioFiltering();
 
@@ -32,42 +26,51 @@ async function main() {
   const config = parseConfig();
   const messageStore = new MessageStore();
 
-  const connection = new BotConnection(
-    config,
-    {
-      onLog: log,
-      onChatMessage: (username, message) => messageStore.addMessage(username, message)
-    }
-  );
+  const callbacks: BackendCallbacks = {
+    onLog: log,
+    onChatMessage: (username, message) => messageStore.addMessage(username, message)
+  };
 
-  connection.connect();
+  const backend = await selectBackend(config, callbacks);
 
   const server = new McpServer({
     name: "minecraft-mcp-server",
     version: "2.0.4"
   });
 
-  const factory = new ToolFactory(server, connection);
-  const getBot = () => connection.getBot()!;
-
-  registerPositionTools(factory, getBot);
-  registerInventoryTools(factory, getBot);
-  registerBlockTools(factory, getBot);
-  registerEntityTools(factory, getBot);
-  registerChatTools(factory, getBot, messageStore);
-  registerFlightTools(factory, getBot);
-  registerGameStateTools(factory, getBot);
-  registerCraftingTools(factory, getBot);
-  registerFurnaceTools(factory, getBot);
+  const factory = new ToolFactory(server, backend);
+  backend.registerTools(factory, messageStore);
+  registerRuntimeCapabilitiesTool(factory, () => backend);
 
   process.stdin.on('end', () => {
-    connection.cleanup();
+    backend.cleanup();
     log('info', 'MCP Client has disconnected. Shutting down...');
     process.exit(0);
   });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+async function selectBackend(config: ReturnType<typeof parseConfig>, callbacks: BackendCallbacks): Promise<GameBackend> {
+  if (config.backend === 'mineflayer') {
+    callbacks.onLog('info', 'Using Mineflayer backend');
+    return new MineflayerBackend(config, callbacks);
+  }
+
+  if (config.backend === 'client-bridge') {
+    callbacks.onLog('info', 'Using client-bridge backend');
+    return new ClientBridgeBackend(config, callbacks);
+  }
+
+  const bridgeBackend = new ClientBridgeBackend(config, callbacks);
+  if (await bridgeBackend.probe()) {
+    callbacks.onLog('info', 'Auto-selected client-bridge backend');
+    return bridgeBackend;
+  }
+
+  callbacks.onLog('info', 'Auto-selected mineflayer backend');
+  return new MineflayerBackend(config, callbacks);
 }
 
 main().catch((error) => {

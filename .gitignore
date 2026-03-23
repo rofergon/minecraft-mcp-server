@@ -24,3 +24,7 @@ pids/
 # Claude Code configuration
 .claude
 .idea
+
+# Fabric companion build artifacts
+fabric-companion/.gradle/
+fabric-companion/build/

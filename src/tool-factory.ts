@@ -1,6 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z, ZodError, ZodRawShape, ZodType } from "zod";
-import { BotConnection } from './bot-connection.js';
+import type { ConnectionCheckResult } from './backend.js';
+
+interface ConnectionLike {
+  checkConnectionAndReconnect: () => Promise<ConnectionCheckResult>;
+}
 
 type McpResponse = {
   content: { type: "text"; text: string }[];
@@ -11,7 +15,7 @@ type McpResponse = {
 export class ToolFactory {
   constructor(
     private server: McpServer,
-    private connection: BotConnection
+    private connection: ConnectionLike
   ) {}
 
   registerTool(

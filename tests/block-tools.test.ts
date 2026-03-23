@@ -173,6 +173,45 @@ test('dig-block handles air blocks', async (t) => {
   t.true(result.content[0].text.includes('No block found'));
 });
 
+test('dig-block uses the bot height as the approach level for tall blocks', async (t) => {
+  const mockServer = {
+    tool: sinon.stub()
+  } as unknown as McpServer;
+  const mockConnection = {
+    checkConnectionAndReconnect: sinon.stub().resolves({ connected: true })
+  } as unknown as BotConnection;
+  const factory = new ToolFactory(mockServer, mockConnection);
+
+  const mockBlock = {
+    name: 'oak_log',
+    position: new Vec3(10, 68, 20)
+  };
+  const pathfinderGoto = sinon.stub().resolves();
+  const mockBot = {
+    entity: { position: new Vec3(10, 64, 20) },
+    blockAt: sinon.stub().returns(mockBlock),
+    canDigBlock: sinon.stub().returns(false),
+    canSeeBlock: sinon.stub().returns(false),
+    pathfinder: { goto: pathfinderGoto }
+  } as unknown as mineflayer.Bot;
+  const getBot = () => mockBot;
+
+  registerBlockTools(factory, getBot);
+
+  const toolCalls = (mockServer.tool as sinon.SinonStub).getCalls();
+  const digBlockCall = toolCalls.find(call => call.args[0] === 'dig-block');
+  const executor = digBlockCall!.args[3];
+
+  await executor({ x: 10, y: 68, z: 20 });
+
+  t.true(pathfinderGoto.calledOnce);
+  const goal = pathfinderGoto.firstCall.args[0] as { x: number; y: number; z: number; range: number };
+  t.is(goal.x, 10);
+  t.is(goal.y, 64);
+  t.is(goal.z, 20);
+  t.is(goal.range, 1);
+});
+
 test('find-block returns not found when block not found', async (t) => {
   const mockServer = {
     tool: sinon.stub()
