@@ -36,17 +36,27 @@ final class NavigationController {
     MoveResult moveToPositionSync(Vec3d target, double range, long timeoutMs, boolean allowJump, boolean clearSoftObstructions) throws Exception {
         long deadline = System.currentTimeMillis() + timeoutMs;
         StuckTracker stuckTracker = new StuckTracker();
+        SafetyTracker safetyTracker = new SafetyTracker();
 
         try {
             while (System.currentTimeMillis() < deadline) {
-                MoveTickResult tick = callOnClientThread(() -> updateNavigationTick(target, range, allowJump, clearSoftObstructions, stuckTracker));
+                MoveTickResult tick = callOnClientThread(() -> updateNavigationTick(target, range, allowJump, clearSoftObstructions, stuckTracker, safetyTracker));
                 if (tick.arrived()) {
                     return new MoveResult(tick.position());
                 }
 
+                if (tick.state() == NavigationState.HAZARD) {
+                    throw new IllegalStateException(
+                        "Move failed [hazard] near (" +
+                            Math.floor(tick.position().x) + ", " +
+                            Math.floor(tick.position().y) + ", " +
+                            Math.floor(tick.position().z) + "): " + tick.status()
+                    );
+                }
+
                 if (tick.state() == NavigationState.STUCK_RECOVERY && stuckTracker.recoveryAttempts() > 4) {
                     throw new IllegalStateException(
-                        "Move failed near (" +
+                        "Move failed [stuck] near (" +
                             Math.floor(tick.position().x) + ", " +
                             Math.floor(tick.position().y) + ", " +
                             Math.floor(tick.position().z) + "): " + tick.status()
@@ -58,7 +68,7 @@ final class NavigationController {
 
             MoveTickResult current = callOnClientThread(() -> currentMoveTick(target, range));
             throw new IllegalStateException(
-                "Move timed out after " + timeoutMs + "ms. Current position: (" +
+                "Move failed [timeout] after " + timeoutMs + "ms. Current position: (" +
                     Math.floor(current.position().x) + ", " +
                     Math.floor(current.position().y) + ", " +
                     Math.floor(current.position().z) + "). State: " + current.state() + ". " + current.status()
@@ -71,7 +81,14 @@ final class NavigationController {
         }
     }
 
-    private MoveTickResult updateNavigationTick(Vec3d target, double range, boolean allowJump, boolean clearSoftObstructions, StuckTracker stuckTracker) {
+    private MoveTickResult updateNavigationTick(
+        Vec3d target,
+        double range,
+        boolean allowJump,
+        boolean clearSoftObstructions,
+        StuckTracker stuckTracker,
+        SafetyTracker safetyTracker
+    ) {
         MinecraftClient client = MinecraftClient.getInstance();
         ClientPlayerEntity player = client.player;
         ClientWorld world = client.world;
@@ -87,6 +104,13 @@ final class NavigationController {
         if (arrived) {
             stopMovement(client);
             return new MoveTickResult(true, current, NavigationState.MOVING_DIRECT, "Arrived");
+        }
+
+        NavigationSafety.HazardAssessment safety = safetyTracker.evaluate(world, player, current, target);
+        if (safety.hazardous()) {
+            stopMovement(client);
+            hooks.stopDigging(client);
+            return new MoveTickResult(false, current, NavigationState.HAZARD, safety.detail());
         }
 
         double totalDistance = current.distanceTo(target);
@@ -260,7 +284,54 @@ final class NavigationController {
         MOVING_DIRECT,
         STEP_UP_ATTEMPT,
         STUCK_RECOVERY,
-        DIGGING
+        DIGGING,
+        HAZARD
+    }
+
+    private static final class SafetyTracker {
+        private static final int MAX_WATER_TICKS = 30;
+        private static final int LOW_AIR_THRESHOLD = 80;
+        private static final float DAMAGE_ABORT_THRESHOLD = 2.0F;
+
+        private Float lastHealth;
+        private float baselineHealth;
+        private int damageEvents;
+        private int waterTicks;
+
+        NavigationSafety.HazardAssessment evaluate(ClientWorld world, ClientPlayerEntity player, Vec3d current, Vec3d target) {
+            if (lastHealth == null) {
+                lastHealth = player.getHealth();
+                baselineHealth = player.getHealth();
+            }
+
+            float health = player.getHealth();
+            if (health + 0.01F < lastHealth) {
+                damageEvents++;
+            }
+            lastHealth = health;
+
+            if ((baselineHealth - health) >= DAMAGE_ABORT_THRESHOLD || damageEvents >= 2) {
+                return NavigationSafety.HazardAssessment.hazard(
+                    "damage",
+                    "Player took repeated damage while moving. Health dropped from " + baselineHealth + " to " + health
+                );
+            }
+
+            if (player.isSubmergedInWater() || player.isTouchingWater()) {
+                waterTicks++;
+            } else {
+                waterTicks = 0;
+            }
+
+            if ((player.isSubmergedInWater() && waterTicks >= 10) || waterTicks >= MAX_WATER_TICKS || player.getAir() <= LOW_AIR_THRESHOLD) {
+                return NavigationSafety.HazardAssessment.hazard(
+                    "drowning",
+                    "Dangerous water exposure detected while moving. Air=" + player.getAir() + ", waterTicks=" + waterTicks
+                );
+            }
+
+            return NavigationSafety.assessPath(world, current, target);
+        }
     }
 
     private static final class StuckTracker {

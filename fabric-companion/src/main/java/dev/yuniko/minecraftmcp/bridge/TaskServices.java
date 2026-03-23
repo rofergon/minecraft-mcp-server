@@ -42,6 +42,7 @@ final class TaskServices {
         int processed = 0;
         int lastCollected = 0;
         Set<BlockPos> ignoredTargets = new HashSet<>();
+        String lastFailure = null;
 
         while (lastCollected < amount) {
             HarvestTarget target = hooks.findNearestHarvestTarget(normalizedType, maxRadius, ignoredTargets);
@@ -60,6 +61,11 @@ final class TaskServices {
                     hooks.sendJobProgress("harvest-wood", "Progress: " + lastCollected + "/" + amount + " logs collected after processing " + processed + " block(s).");
                 }
             } catch (Exception error) {
+                if (isCriticalFailure(error)) {
+                    throw new IllegalStateException("harvest-wood aborted: " + safeMessage(error), error);
+                }
+
+                lastFailure = safeMessage(error);
                 ignoredTargets.add(target.position());
                 if (ignoredTargets.size() >= 24) {
                     break;
@@ -70,8 +76,9 @@ final class TaskServices {
         int collected = Math.max(0, hooks.countMatchingLogsInInventory(normalizedType) - startingCount);
         BlockPos finalPosition = hooks.currentPlayerBlockPos();
         if (collected < amount) {
+            String suffix = lastFailure == null ? "" : " Last failure: " + lastFailure;
             throw new IllegalStateException(
-                "Stopped after collecting " + collected + "/" + amount + " log(s). No more valid targets were found within " + maxRadius + " blocks."
+                "Stopped after collecting " + collected + "/" + amount + " log(s). No more valid targets were found within " + maxRadius + " blocks." + suffix
             );
         }
 
@@ -85,6 +92,7 @@ final class TaskServices {
         int processed = 0;
         int lastCollected = 0;
         Set<BlockPos> ignoredTargets = new HashSet<>();
+        String lastFailure = null;
 
         while (lastCollected < amount) {
             MineTarget target = hooks.findNearestMineTarget(targetBlocks, maxRadius, ignoredTargets);
@@ -106,6 +114,11 @@ final class TaskServices {
                     );
                 }
             } catch (Exception error) {
+                if (isCriticalFailure(error)) {
+                    throw new IllegalStateException("mine-cobblestone aborted: " + safeMessage(error), error);
+                }
+
+                lastFailure = safeMessage(error);
                 ignoredTargets.add(target.position());
                 if (ignoredTargets.size() >= 24) {
                     break;
@@ -116,8 +129,9 @@ final class TaskServices {
         int collected = Math.max(0, hooks.countMatchingInventoryItems(targetItem) - startingCount);
         BlockPos finalPosition = hooks.currentPlayerBlockPos();
         if (collected < amount) {
+            String suffix = lastFailure == null ? "" : " Last failure: " + lastFailure;
             throw new IllegalStateException(
-                "Stopped after collecting " + collected + "/" + amount + " cobblestone. No more valid stone or cobblestone targets were found within " + maxRadius + " blocks."
+                "Stopped after collecting " + collected + "/" + amount + " cobblestone. No more valid stone or cobblestone targets were found within " + maxRadius + " blocks." + suffix
             );
         }
 
@@ -145,5 +159,17 @@ final class TaskServices {
         }
 
         return normalized;
+    }
+
+    private boolean isCriticalFailure(Exception error) {
+        String message = safeMessage(error);
+        return message.contains("[hazard]") || message.contains("[stuck]") || message.contains("[timeout]");
+    }
+
+    private String safeMessage(Exception error) {
+        if (error.getMessage() == null || error.getMessage().isBlank()) {
+            return error.getClass().getSimpleName();
+        }
+        return error.getMessage();
     }
 }

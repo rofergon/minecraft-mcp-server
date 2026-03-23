@@ -1538,6 +1538,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
 
     private ScoredHarvestTarget evaluateHarvestBatch(SearchOrigin origin, String preferredType, Set<BlockPos> ignoredTargets, List<BlockPos> batch) {
         ClientWorld world = requireWorld();
+        BlockPos playerFeet = currentPlayerBlockPosOnClientThread();
         ScoredHarvestTarget bestTarget = null;
 
         for (BlockPos candidate : batch) {
@@ -1552,8 +1553,26 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             }
 
             boolean reachableNow = isBlockReachableNow(candidate).reachable();
-            boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
+            DigCandidate digCandidate = selectBestDigCandidate(findDigCandidates(candidate));
+            boolean canReposition = digCandidate != null;
             if (!reachableNow && !canReposition) {
+                continue;
+            }
+
+            NavigationSafety.HazardAssessment collectionSafety = NavigationSafety.assessFooting(
+                world,
+                new BlockPos(candidate.getX(), Math.max(world.getBottomY(), candidate.getY() - 1), candidate.getZ())
+            );
+            if (collectionSafety.hazardous()) {
+                continue;
+            }
+
+            if (!reachableNow && isDigCandidateHazardous(world, digCandidate)) {
+                continue;
+            }
+
+            NavigationSafety.HazardAssessment pathSafety = NavigationSafety.assessPath(world, Vec3d.ofCenter(playerFeet), Vec3d.ofCenter(candidate));
+            if (pathSafety.hazardous()) {
                 continue;
             }
 
@@ -1591,6 +1610,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
 
     private ScoredMineTarget evaluateMineBatch(SearchOrigin origin, Set<String> blockTypes, Set<BlockPos> ignoredTargets, List<BlockPos> batch) {
         ClientWorld world = requireWorld();
+        BlockPos playerFeet = currentPlayerBlockPosOnClientThread();
         ScoredMineTarget bestTarget = null;
 
         for (BlockPos candidate : batch) {
@@ -1605,9 +1625,27 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             }
 
             boolean reachableNow = isBlockReachableNow(candidate).reachable();
-            boolean canReposition = selectBestDigCandidate(findDigCandidates(candidate)) != null;
+            DigCandidate digCandidate = selectBestDigCandidate(findDigCandidates(candidate));
+            boolean canReposition = digCandidate != null;
             boolean obstruction = !reachableNow && !canReposition && findClearableDigObstruction(candidate) != null;
             if (!reachableNow && !canReposition && !obstruction) {
+                continue;
+            }
+
+            NavigationSafety.HazardAssessment collectionSafety = NavigationSafety.assessFooting(
+                world,
+                new BlockPos(candidate.getX(), Math.max(world.getBottomY(), candidate.getY() - 1), candidate.getZ())
+            );
+            if (collectionSafety.hazardous()) {
+                continue;
+            }
+
+            if (!reachableNow && digCandidate != null && isDigCandidateHazardous(world, digCandidate)) {
+                continue;
+            }
+
+            NavigationSafety.HazardAssessment pathSafety = NavigationSafety.assessPath(world, Vec3d.ofCenter(playerFeet), Vec3d.ofCenter(candidate));
+            if (pathSafety.hazardous()) {
                 continue;
             }
 
@@ -1631,6 +1669,10 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private BlockPos currentPlayerBlockPosOnClientThread() {
         ClientPlayerEntity player = requirePlayer();
         return BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
+    }
+
+    private boolean isDigCandidateHazardous(ClientWorld world, DigCandidate candidate) {
+        return candidate == null || NavigationSafety.assessFooting(world, candidate.feetPos()).hazardous();
     }
 
     private ClientPlayerEntity requirePlayer() {
@@ -1716,6 +1758,12 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                     "No valid digging position found for block at (" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")"
                 );
             }
+            NavigationSafety.HazardAssessment movementSafety = callOnClientThread(
+                () -> NavigationSafety.assessFooting(requireWorld(), candidate.feetPos())
+            );
+            if (movementSafety.hazardous()) {
+                throw new IllegalStateException("Dig failed [hazard]: " + movementSafety.detail());
+            }
             navigationController.moveToPositionSync(candidate.standPosition(), candidate.range(), 15000L, true, true);
             break;
         }
@@ -1740,6 +1788,12 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                         throw new IllegalStateException(
                             "Lost reachability to block at (" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ") and found no alternative position"
                         );
+                    }
+                    NavigationSafety.HazardAssessment movementSafety = callOnClientThread(
+                        () -> NavigationSafety.assessFooting(requireWorld(), candidate.feetPos())
+                    );
+                    if (movementSafety.hazardous()) {
+                        throw new IllegalStateException("Dig failed [hazard]: " + movementSafety.detail());
                     }
                     navigationController.moveToPositionSync(candidate.standPosition(), candidate.range(), 8000L, true, true);
                     continue;
