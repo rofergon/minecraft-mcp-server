@@ -257,3 +257,32 @@ test('client bridge passthrough tool forwards structuredContent from action data
 
   t.deepEqual(result.structuredContent, { x: 1, y: 2, z: 3 });
 });
+
+test('client bridge keeps last known worldReady during transient disconnects', async (t) => {
+  const backend = new ClientBridgeBackend({
+    backend: 'client-bridge',
+    host: 'localhost',
+    port: 25565,
+    username: 'LLMBot',
+    bridgeHost: '127.0.0.1',
+    bridgePort: 25570,
+    bridgeToken: undefined,
+    autoReconnect: false
+  }, {
+    onLog: () => undefined,
+    onChatMessage: () => undefined
+  });
+
+  (backend as unknown as {
+    handleMessage: (message: { type: 'session_state'; worldReady: boolean }) => void;
+    handleDisconnect: (reason: string) => void;
+  }).handleMessage({
+    type: 'session_state',
+    worldReady: true
+  });
+
+  (backend as unknown as { handleDisconnect: (reason: string) => void }).handleDisconnect('Socket closed');
+
+  const capabilities = await backend.getRuntimeCapabilities();
+  t.true(capabilities.worldReady);
+});

@@ -47,6 +47,22 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private static final String BRIDGE_VERSION = "0.1.0";
     private static final int SCAN_BATCH_SIZE = 2048;
     private static final BridgeRecipeCatalog RECIPE_CATALOG = BridgeRecipeCatalog.createDefault();
+    private static final Set<String> CLEARABLE_FOLIAGE_BLOCKS = Set.of(
+        "dead_bush",
+        "sweet_berry_bush",
+        "azalea",
+        "flowering_azalea",
+        "mangrove_roots",
+        "mangrove_propagule",
+        "vine",
+        "cave_vines",
+        "cave_vines_plant",
+        "weeping_vines",
+        "weeping_vines_plant",
+        "twisting_vines",
+        "twisting_vines_plant",
+        "hanging_roots"
+    );
     private static final Set<String> CLEARABLE_SOFT_BLOCKS = Set.of(
         "dirt",
         "grass_block",
@@ -1852,30 +1868,49 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             return candidates;
         }
 
+        double eyeHeight = player.getEyeHeight(player.getPose());
+        double reachDistance = getInteractionReach(player);
+        int maxVerticalDrop = maxDigCandidateVerticalDrop(reachDistance, eyeHeight);
+
+        for (BlockPos feetPos : enumerateDigCandidateFeetPositions(targetPos, maxVerticalDrop)) {
+            if (!isStandable(world, feetPos)) {
+                continue;
+            }
+
+            Vec3d standPosition = new Vec3d(feetPos.getX() + 0.5D, feetPos.getY(), feetPos.getZ() + 0.5D);
+            Vec3d eyePosition = standPosition.add(0.0D, eyeHeight, 0.0D);
+            ReachabilityResult reachability = findReachability(world, eyePosition, targetPos, reachDistance);
+            if (!reachability.reachable()) {
+                continue;
+            }
+
+            int offsetX = feetPos.getX() - targetPos.getX();
+            int offsetZ = feetPos.getZ() - targetPos.getZ();
+            double distanceScore = standPosition.squaredDistanceTo(player.getX(), player.getY(), player.getZ());
+            double verticalPenalty = Math.abs(standPosition.y - player.getY()) * 4.0D;
+            double diagonalPenalty = (Math.abs(offsetX) + Math.abs(offsetZ) == 2) ? 0.35D : 0.0D;
+            double score = distanceScore + verticalPenalty + (reachability.distanceSq() * 0.25D) + diagonalPenalty;
+            candidates.add(new DigCandidate(feetPos, standPosition, score, Math.max(0.7D, Math.sqrt(reachability.distanceSq()) - 0.6D)));
+        }
+
+        return candidates;
+    }
+
+    static int maxDigCandidateVerticalDrop(double reachDistance, double eyeHeight) {
+        return Math.max(2, (int) Math.ceil(reachDistance + eyeHeight - 0.5D));
+    }
+
+    static List<BlockPos> enumerateDigCandidateFeetPositions(BlockPos targetPos, int maxVerticalDrop) {
         int[][] offsets = new int[][] {
+            { 0, 0 },
             { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
             { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 }
         };
+        List<BlockPos> candidates = new ArrayList<>();
 
-        for (int dy = -1; dy <= 1; dy++) {
+        for (int dy = -Math.max(1, maxVerticalDrop); dy <= 1; dy++) {
             for (int[] offset : offsets) {
-                BlockPos feetPos = new BlockPos(targetPos.getX() + offset[0], targetPos.getY() + dy, targetPos.getZ() + offset[1]);
-                if (!isStandable(world, feetPos)) {
-                    continue;
-                }
-
-                Vec3d standPosition = new Vec3d(feetPos.getX() + 0.5D, feetPos.getY(), feetPos.getZ() + 0.5D);
-                Vec3d eyePosition = standPosition.add(0.0D, player.getEyeHeight(player.getPose()), 0.0D);
-                ReachabilityResult reachability = findReachability(world, eyePosition, targetPos, getInteractionReach(player));
-                if (!reachability.reachable()) {
-                    continue;
-                }
-
-                double distanceScore = standPosition.squaredDistanceTo(player.getX(), player.getY(), player.getZ());
-                double verticalPenalty = Math.abs(standPosition.y - player.getY()) * 4.0D;
-                double diagonalPenalty = (Math.abs(offset[0]) + Math.abs(offset[1]) == 2) ? 0.35D : 0.0D;
-                double score = distanceScore + verticalPenalty + (reachability.distanceSq() * 0.25D) + diagonalPenalty;
-                candidates.add(new DigCandidate(feetPos, standPosition, score, Math.max(0.7D, Math.sqrt(reachability.distanceSq()) - 0.6D)));
+                candidates.add(new BlockPos(targetPos.getX() + offset[0], targetPos.getY() + dy, targetPos.getZ() + offset[1]));
             }
         }
 
@@ -1937,7 +1972,12 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
 
     private boolean isClearableFoliage(ClientWorld world, BlockPos pos) {
         BlockState state = world.getBlockState(pos);
-        return !state.isAir() && state.isIn(BlockTags.LEAVES);
+        if (state.isAir()) {
+            return false;
+        }
+
+        String localId = localBlockId(Registries.BLOCK.getId(state.getBlock()).toString());
+        return state.isIn(BlockTags.LEAVES) || isClearableFoliageId(localId);
     }
 
     private BlockPos findClearableDigObstruction(BlockPos targetPos) {
@@ -1979,7 +2019,21 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
 
         String localId = localBlockId(Registries.BLOCK.getId(state.getBlock()).toString());
-        return CLEARABLE_SOFT_BLOCKS.contains(localId) || state.isIn(BlockTags.LEAVES);
+        return state.isIn(BlockTags.LEAVES) || isClearableMiningObstructionId(localId);
+    }
+
+    static boolean isClearableFoliageId(String localId) {
+        if (localId == null || localId.isBlank()) {
+            return false;
+        }
+
+        return CLEARABLE_FOLIAGE_BLOCKS.contains(localId)
+            || localId.endsWith("_sapling")
+            || localId.endsWith("_propagule");
+    }
+
+    static boolean isClearableMiningObstructionId(String localId) {
+        return CLEARABLE_SOFT_BLOCKS.contains(localId) || isClearableFoliageId(localId);
     }
 
     private double getInteractionReach(ClientPlayerEntity player) {

@@ -385,7 +385,6 @@ export class ClientBridgeBackend implements GameBackend {
 
   private handleDisconnect(reason: string): void {
     this.state = 'disconnected';
-    this.worldReady = false;
     this.lastError = reason;
 
     if (this.socket) {

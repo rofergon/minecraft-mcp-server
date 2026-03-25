@@ -7,6 +7,9 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 
 final class NavigationController {
+    private static final double MIN_ARRIVAL_RANGE = 0.35D;
+    private static final double RECOVERY_DIRECTION_TIE_EPSILON = 0.15D;
+
     interface Hooks {
         boolean isBlockReachable(BlockPos pos);
         boolean tickClearObstruction(BlockPos pos);
@@ -96,11 +99,12 @@ final class NavigationController {
             return new MoveTickResult(true, Vec3d.ZERO, NavigationState.MOVING_DIRECT, "World not ready");
         }
 
+        double effectiveRange = effectiveArrivalRange(range);
         Vec3d current = new Vec3d(player.getX(), player.getY(), player.getZ());
         double dx = target.x - current.x;
         double dz = target.z - current.z;
         double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-        boolean arrived = horizontalDistance <= range && Math.abs(target.y - current.y) <= 1.5D;
+        boolean arrived = horizontalDistance <= effectiveRange && Math.abs(target.y - current.y) <= 1.5D;
         if (arrived) {
             stopMovement(client);
             return new MoveTickResult(true, current, NavigationState.MOVING_DIRECT, "Arrived");
@@ -163,7 +167,8 @@ final class NavigationController {
 
         if (stuckTracker.shouldStartRecovery(blocked)) {
             stopMovement(client);
-            stuckTracker.startRecovery();
+            boolean recoverLeft = chooseRecoveryLeft(player, world, target, stuckTracker.recoverLeft());
+            stuckTracker.startRecovery(recoverLeft);
             return new MoveTickResult(false, current, NavigationState.STUCK_RECOVERY, "Blocked without progress");
         }
 
@@ -195,7 +200,7 @@ final class NavigationController {
         double dx = target.x - current.x;
         double dz = target.z - current.z;
         double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-        boolean arrived = horizontalDistance <= range && Math.abs(target.y - current.y) <= 1.5D;
+        boolean arrived = horizontalDistance <= effectiveArrivalRange(range) && Math.abs(target.y - current.y) <= 1.5D;
         return new MoveTickResult(arrived, current, NavigationState.MOVING_DIRECT, arrived ? "Arrived" : "Awaiting progress");
     }
 
@@ -228,6 +233,44 @@ final class NavigationController {
         BlockPos aheadFeet = BlockPos.ofFloored(player.getX() + normalized.x, player.getY(), player.getZ() + normalized.z);
         BlockPos aheadHead = aheadFeet.up();
         return !isSpaceClear(world, aheadFeet) || !isSpaceClear(world, aheadHead);
+    }
+
+    private boolean chooseRecoveryLeft(ClientPlayerEntity player, ClientWorld world, Vec3d target, boolean fallbackLeft) {
+        Vec3d direction = new Vec3d(target.x - player.getX(), 0.0D, target.z - player.getZ());
+        if (direction.lengthSquared() < 1.0E-4D) {
+            return fallbackLeft;
+        }
+
+        Vec3d forward = direction.normalize();
+        Vec3d left = new Vec3d(forward.z, 0.0D, -forward.x);
+        Vec3d right = left.multiply(-1.0D);
+        double leftScore = scoreRecoveryDirection(player, world, forward, left);
+        double rightScore = scoreRecoveryDirection(player, world, forward, right);
+        return preferLeftRecovery(leftScore, rightScore, fallbackLeft);
+    }
+
+    private double scoreRecoveryDirection(ClientPlayerEntity player, ClientWorld world, Vec3d forward, Vec3d side) {
+        Vec3d origin = new Vec3d(player.getX(), player.getY(), player.getZ());
+        double[] forwardOffsets = new double[] { 0.25D, 0.55D, 0.9D };
+        double[] sideOffsets = new double[] { 0.3D, 0.6D };
+        double score = 0.0D;
+
+        for (double forwardOffset : forwardOffsets) {
+            Vec3d forwardStep = forward.multiply(forwardOffset);
+            for (double sideOffset : sideOffsets) {
+                Vec3d sample = origin.add(forwardStep).add(side.multiply(sideOffset));
+                BlockPos feet = BlockPos.ofFloored(sample);
+                boolean hasBodySpace = isSpaceClear(world, feet) && isSpaceClear(world, feet.up());
+                if (!hasBodySpace) {
+                    score -= 1.25D;
+                    continue;
+                }
+
+                score += isSolidGround(world, feet.down()) ? 1.0D : 0.2D;
+            }
+        }
+
+        return score;
     }
 
     private BlockPos findClearableObstructionAhead(ClientPlayerEntity player, ClientWorld world, Vec3d target) {
@@ -265,6 +308,18 @@ final class NavigationController {
 
     private boolean isSolidGround(ClientWorld world, BlockPos pos) {
         return !world.getBlockState(pos).getCollisionShape(world, pos).isEmpty();
+    }
+
+    static double effectiveArrivalRange(double requestedRange) {
+        return Math.max(requestedRange, MIN_ARRIVAL_RANGE);
+    }
+
+    static boolean preferLeftRecovery(double leftScore, double rightScore, boolean fallbackLeft) {
+        if (Math.abs(leftScore - rightScore) <= RECOVERY_DIRECTION_TIE_EPSILON) {
+            return fallbackLeft;
+        }
+
+        return leftScore > rightScore;
     }
 
     private void stopMovement(MinecraftClient client) {
@@ -362,10 +417,10 @@ final class NavigationController {
             return blocked && !isRecovering() && (System.currentTimeMillis() - lastProgressAt) >= STUCK_THRESHOLD_MS;
         }
 
-        void startRecovery() {
+        void startRecovery(boolean recoverLeft) {
             recoveryTicksRemaining = RECOVERY_TICKS;
             recoveryAttempts++;
-            recoverLeft = !recoverLeft;
+            this.recoverLeft = recoverLeft;
             lastProgressAt = System.currentTimeMillis();
         }
 
