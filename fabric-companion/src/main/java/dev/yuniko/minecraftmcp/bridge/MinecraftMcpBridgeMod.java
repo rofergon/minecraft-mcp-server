@@ -1,7 +1,6 @@
 package dev.yuniko.minecraftmcp.bridge;
 
 import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
@@ -92,7 +91,6 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private final ActionCoordinator actionCoordinator = new ActionCoordinator();
     private final ActionDispatcher actionDispatcher = new ActionDispatcher(new BridgeActionHandler());
     private final NavigationController navigationController = new NavigationController(clientThreadExecutor, new NavigationHooks());
-    private final TaskServices taskServices = new TaskServices(new TaskHooks());
     private BridgeConfig config;
     private BridgeServer bridgeServer;
     private volatile boolean lastWorldReady = false;
@@ -106,48 +104,48 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         monitor.scheduleAtFixedRate(this::monitorWorldState, 0, 500, TimeUnit.MILLISECONDS);
     }
 
-    private void handleActionRequest(String requestId, String action, JsonObject args) {
+    private void handleActionRequest(ProtocolSession session, String requestId, String action, JsonObject args) {
+        ActionContext context = new ActionContext(session, requestId);
         if (!SUPPORTED_ACTIONS.contains(action)) {
-            sendError(requestId, "Action '" + action + "' is not yet supported by the Fabric companion.");
+            context.sendError("Action '" + action + "' is not yet supported by the Fabric companion.");
             return;
         }
 
         actionCoordinator.dispatch(
             executionModeFor(action),
-            () -> executeAction(requestId, action, args),
-            (error) -> sendError(
-                requestId,
+            () -> executeAction(context, action, args),
+            (error) -> context.sendError(
                 "Unexpected failure while executing '" + action + "': " + (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage())
             )
         );
     }
 
-    private void executeAction(String requestId, String action, JsonObject args) {
+    private void executeAction(ActionContext context, String action, JsonObject args) {
         SessionStateSnapshot sessionState = readSessionStateSnapshotSafely();
         if (!sessionState.worldReady()) {
-            sendError(requestId, "Minecraft world is not ready yet. Join a world or server first.");
+            context.sendError("Minecraft world is not ready yet. Join a world or server first.");
             return;
         }
 
         switch (action) {
-            case "get-position" -> handleGetPosition(requestId);
-            case "list-inventory" -> handleListInventory(requestId);
-            case "find-item" -> handleFindItem(requestId, args);
-            case "equip-item" -> handleEquipItem(requestId, args);
-            case "move-to-position" -> handleMoveToPosition(requestId, args);
-            case "dig-block" -> handleDigBlock(requestId, args);
-            case "harvest-wood" -> handleHarvestWood(requestId, args);
-            case "mine-cobblestone" -> handleMineCobblestone(requestId, args);
-            case "get-block-info" -> handleGetBlockInfo(requestId, args);
-            case "find-block" -> handleFindBlock(requestId, args);
-            case "place-block" -> handlePlaceBlock(requestId, args);
-            case "list-recipes" -> handleListRecipes(requestId, args);
-            case "get-recipe" -> handleGetRecipe(requestId, args);
-            case "can-craft" -> handleCanCraft(requestId, args);
-            case "craft-item" -> handleCraftItem(requestId, args);
-            case "detect-gamemode" -> handleDetectGamemode(requestId);
-            case "send-chat" -> handleSendChat(requestId, args);
-            default -> sendError(requestId, "Action '" + action + "' is not yet implemented.");
+            case "get-position" -> handleGetPosition(context);
+            case "list-inventory" -> handleListInventory(context);
+            case "find-item" -> handleFindItem(context, args);
+            case "equip-item" -> handleEquipItem(context, args);
+            case "move-to-position" -> handleMoveToPosition(context, args);
+            case "dig-block" -> handleDigBlock(context, args);
+            case "harvest-wood" -> handleHarvestWood(context, args);
+            case "mine-cobblestone" -> handleMineCobblestone(context, args);
+            case "get-block-info" -> handleGetBlockInfo(context, args);
+            case "find-block" -> handleFindBlock(context, args);
+            case "place-block" -> handlePlaceBlock(context, args);
+            case "list-recipes" -> handleListRecipes(context, args);
+            case "get-recipe" -> handleGetRecipe(context, args);
+            case "can-craft" -> handleCanCraft(context, args);
+            case "craft-item" -> handleCraftItem(context, args);
+            case "detect-gamemode" -> handleDetectGamemode(context);
+            case "send-chat" -> handleSendChat(context, args);
+            default -> context.sendError("Action '" + action + "' is not yet implemented.");
         }
     }
 
@@ -174,20 +172,20 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         };
     }
 
-    private void handleGetPosition(String requestId) {
+    private void handleGetPosition(ActionContext context) {
         try {
             PositionSnapshot position = callOnClientThread(this::readPlayerPosition);
             JsonObject data = new JsonObject();
             data.addProperty("x", position.x());
             data.addProperty("y", position.y());
             data.addProperty("z", position.z());
-            sendActionResult(requestId, "Current position: (" + position.x() + ", " + position.y() + ", " + position.z() + ")", data);
+            context.sendActionResult("Current position: (" + position.x() + ", " + position.y() + ", " + position.z() + ")", data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleListInventory(String requestId) {
+    private void handleListInventory(ActionContext context) {
         try {
             List<InventoryItemSnapshot> inventory = callOnClientThread(this::readInventorySnapshot);
             JsonArray items = new JsonArray();
@@ -213,20 +211,20 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             }
 
             if (inventory.isEmpty()) {
-                sendActionResult(requestId, "Inventory is empty", items);
+                context.sendActionResult("Inventory is empty", items);
                 return;
             }
 
-            sendActionResult(requestId, "Found " + inventory.size() + " items in inventory:\n\n" + output, items);
+            context.sendActionResult("Found " + inventory.size() + " items in inventory:\n\n" + output, items);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleFindItem(String requestId, JsonObject args) {
+    private void handleFindItem(ActionContext context, JsonObject args) {
         String query = lower(getAsString(args, "nameOrType"));
         if (query == null || query.isBlank()) {
-            sendError(requestId, "nameOrType is required.");
+            context.sendError("nameOrType is required.");
             return;
         }
 
@@ -238,20 +236,20 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                 data.addProperty("displayName", item.displayName());
                 data.addProperty("count", item.count());
                 data.addProperty("slot", item.slot());
-                sendActionResult(requestId, "Found " + item.id() + " (" + item.displayName() + ") x" + item.count() + " in slot " + item.slot(), data);
+                context.sendActionResult("Found " + item.id() + " (" + item.displayName() + ") x" + item.count() + " in slot " + item.slot(), data);
                 return;
             }
 
-            sendActionResult(requestId, "Couldn't find any item matching '" + query + "' in inventory", new JsonObject());
+            context.sendActionResult("Couldn't find any item matching '" + query + "' in inventory", new JsonObject());
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleEquipItem(String requestId, JsonObject args) {
+    private void handleEquipItem(ActionContext context, JsonObject args) {
         String query = lower(getAsString(args, "itemName"));
         if (query == null || query.isBlank()) {
-            sendError(requestId, "itemName is required.");
+            context.sendError("itemName is required.");
             return;
         }
 
@@ -259,18 +257,18 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             InventoryItemSnapshot equippedItem = callOnClientThread(() -> equipMatchingHotbarItem(query));
             JsonObject data = new JsonObject();
             data.addProperty("slot", equippedItem.slot());
-            sendActionResult(requestId, "Equipped " + equippedItem.id() + " to hand from hotbar slot " + equippedItem.slot(), data);
+            context.sendActionResult("Equipped " + equippedItem.id() + " to hand from hotbar slot " + equippedItem.slot(), data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleGetBlockInfo(String requestId, JsonObject args) {
+    private void handleGetBlockInfo(ActionContext context, JsonObject args) {
         Integer x = getAsInt(args, "x");
         Integer y = getAsInt(args, "y");
         Integer z = getAsInt(args, "z");
         if (x == null || y == null || z == null) {
-            sendError(requestId, "x, y and z are required.");
+            context.sendError("x, y and z are required.");
             return;
         }
 
@@ -282,13 +280,13 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("y", block.y());
             data.addProperty("z", block.z());
             data.addProperty("displayName", block.displayName());
-            sendActionResult(requestId, "Found " + block.id() + " at position (" + block.x() + ", " + block.y() + ", " + block.z() + ")", data);
+            context.sendActionResult("Found " + block.id() + " at position (" + block.x() + ", " + block.y() + ", " + block.z() + ")", data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleMoveToPosition(String requestId, JsonObject args) {
+    private void handleMoveToPosition(ActionContext context, JsonObject args) {
         Integer x = getAsInt(args, "x");
         Integer y = getAsInt(args, "y");
         Integer z = getAsInt(args, "z");
@@ -296,7 +294,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         long timeoutMs = getAsInt(args, "timeoutMs") != null ? Objects.requireNonNull(getAsInt(args, "timeoutMs")) : 15000L;
 
         if (x == null || y == null || z == null) {
-            sendError(requestId, "x, y and z are required.");
+            context.sendError("x, y and z are required.");
             return;
         }
 
@@ -306,19 +304,19 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("x", result.position().x);
             data.addProperty("y", result.position().y);
             data.addProperty("z", result.position().z);
-            sendActionResult(requestId, "Successfully moved to position near (" + x + ", " + y + ", " + z + ")", data);
+            context.sendActionResult("Successfully moved to position near (" + x + ", " + y + ", " + z + ")", data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleDigBlock(String requestId, JsonObject args) {
+    private void handleDigBlock(ActionContext context, JsonObject args) {
         Integer x = getAsInt(args, "x");
         Integer y = getAsInt(args, "y");
         Integer z = getAsInt(args, "z");
 
         if (x == null || y == null || z == null) {
-            sendError(requestId, "x, y and z are required.");
+            context.sendError("x, y and z are required.");
             return;
         }
 
@@ -329,25 +327,25 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("y", y);
             data.addProperty("z", z);
             data.addProperty("block", blockName);
-            sendActionResult(requestId, "Dug " + blockName + " at (" + x + ", " + y + ", " + z + ")", data);
+            context.sendActionResult("Dug " + blockName + " at (" + x + ", " + y + ", " + z + ")", data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleHarvestWood(String requestId, JsonObject args) {
+    private void handleHarvestWood(ActionContext context, JsonObject args) {
         Integer amount = getAsInt(args, "amount");
         String preferredType = lower(getAsString(args, "preferredType"));
         int maxRadius = getAsInt(args, "maxRadius") != null ? Objects.requireNonNull(getAsInt(args, "maxRadius")) : 48;
         int reportEvery = getAsInt(args, "reportEvery") != null ? Objects.requireNonNull(getAsInt(args, "reportEvery")) : 15;
 
         if (amount == null || amount < 1) {
-            sendError(requestId, "amount must be a positive integer.");
+            context.sendError("amount must be a positive integer.");
             return;
         }
 
         try {
-            TaskServices.HarvestWoodResult result = taskServices.harvestWoodSync(amount, preferredType, maxRadius, reportEvery);
+            TaskServices.HarvestWoodResult result = taskServicesFor(context).harvestWoodSync(amount, preferredType, maxRadius, reportEvery);
             JsonObject data = new JsonObject();
             data.addProperty("processed", result.processed());
             data.addProperty("collected", result.collected());
@@ -356,28 +354,27 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("x", result.position().getX());
             data.addProperty("y", result.position().getY());
             data.addProperty("z", result.position().getZ());
-            sendActionResult(
-                requestId,
+            context.sendActionResult(
                 "Harvested " + result.collected() + " log(s) after processing " + result.processed() + " block(s).",
                 data
             );
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleMineCobblestone(String requestId, JsonObject args) {
+    private void handleMineCobblestone(ActionContext context, JsonObject args) {
         Integer amount = getAsInt(args, "amount");
         int maxRadius = getAsInt(args, "maxRadius") != null ? Objects.requireNonNull(getAsInt(args, "maxRadius")) : 32;
         int reportEvery = getAsInt(args, "reportEvery") != null ? Objects.requireNonNull(getAsInt(args, "reportEvery")) : 15;
 
         if (amount == null || amount < 1) {
-            sendError(requestId, "amount must be a positive integer.");
+            context.sendError("amount must be a positive integer.");
             return;
         }
 
         try {
-            TaskServices.MineCobblestoneResult result = taskServices.mineCobblestoneSync(amount, maxRadius, reportEvery);
+            TaskServices.MineCobblestoneResult result = taskServicesFor(context).mineCobblestoneSync(amount, maxRadius, reportEvery);
             JsonObject data = new JsonObject();
             data.addProperty("processed", result.processed());
             data.addProperty("collected", result.collected());
@@ -386,28 +383,27 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("x", result.position().getX());
             data.addProperty("y", result.position().getY());
             data.addProperty("z", result.position().getZ());
-            sendActionResult(
-                requestId,
+            context.sendActionResult(
                 "Mined " + result.collected() + " cobblestone after processing " + result.processed() + " block(s).",
                 data
             );
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleFindBlock(String requestId, JsonObject args) {
+    private void handleFindBlock(ActionContext context, JsonObject args) {
         String query = lower(getAsString(args, "blockType"));
         int maxDistance = getAsInt(args, "maxDistance") != null ? Objects.requireNonNull(getAsInt(args, "maxDistance")) : 16;
         if (query == null || query.isBlank()) {
-            sendError(requestId, "blockType is required.");
+            context.sendError("blockType is required.");
             return;
         }
 
         try {
             FindBlockMatch match = findNearestBlockMatch(query, maxDistance);
             if (match == null) {
-                sendActionResult(requestId, "No " + query + " found within " + maxDistance + " blocks", new JsonObject());
+                context.sendActionResult("No " + query + " found within " + maxDistance + " blocks", new JsonObject());
                 return;
             }
 
@@ -416,23 +412,22 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("x", match.position().getX());
             data.addProperty("y", match.position().getY());
             data.addProperty("z", match.position().getZ());
-            sendActionResult(
-                requestId,
+            context.sendActionResult(
                 "Found " + match.id() + " at position (" + match.position().getX() + ", " + match.position().getY() + ", " + match.position().getZ() + ")",
                 data
             );
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handlePlaceBlock(String requestId, JsonObject args) {
+    private void handlePlaceBlock(ActionContext context, JsonObject args) {
         Integer x = getAsInt(args, "x");
         Integer y = getAsInt(args, "y");
         Integer z = getAsInt(args, "z");
         String faceDirection = lower(getAsString(args, "faceDirection"));
         if (x == null || y == null || z == null) {
-            sendError(requestId, "x, y and z are required.");
+            context.sendError("x, y and z are required.");
             return;
         }
 
@@ -452,13 +447,13 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             if (result.blockId() != null) {
                 data.addProperty("block", result.blockId());
             }
-            sendActionResult(requestId, result.message(), data);
+            context.sendActionResult(result.message(), data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleListRecipes(String requestId, JsonObject args) {
+    private void handleListRecipes(ActionContext context, JsonObject args) {
         String outputItem = lower(getAsString(args, "outputItem"));
         try {
             BridgeRecipeCatalog.StationAccess stationAccess = callOnClientThread(this::readRecipeStationAccessOnClientThread);
@@ -481,8 +476,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             }
 
             if (recipes.isEmpty()) {
-                sendActionResult(
-                    requestId,
+                context.sendActionResult(
                     "No craftable recipes found" + (outputItem != null ? " for " + outputItem : "") + " with current inventory",
                     data
                 );
@@ -503,16 +497,16 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                     .append("\n\n");
             }
 
-            sendActionResult(requestId, output.toString(), data);
+            context.sendActionResult(output.toString(), data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleGetRecipe(String requestId, JsonObject args) {
+    private void handleGetRecipe(ActionContext context, JsonObject args) {
         String itemName = lower(getAsString(args, "itemName"));
         if (itemName == null || itemName.isBlank()) {
-            sendError(requestId, "itemName is required.");
+            context.sendError("itemName is required.");
             return;
         }
 
@@ -531,7 +525,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("itemName", itemName);
 
             if (recipes.isEmpty()) {
-                sendActionResult(requestId, "No recipes found for " + itemName, data);
+                context.sendActionResult("No recipes found for " + itemName, data);
                 return;
             }
 
@@ -550,16 +544,16 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                     .append("\n\n");
             }
 
-            sendActionResult(requestId, output.toString(), data);
+            context.sendActionResult(output.toString(), data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleCanCraft(String requestId, JsonObject args) {
+    private void handleCanCraft(ActionContext context, JsonObject args) {
         String itemName = lower(getAsString(args, "itemName"));
         if (itemName == null || itemName.isBlank()) {
-            sendError(requestId, "itemName is required.");
+            context.sendError("itemName is required.");
             return;
         }
 
@@ -573,7 +567,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             if (recipes.isEmpty()) {
                 data.addProperty("canCraft", false);
                 data.add("missing", new JsonArray());
-                sendActionResult(requestId, "No recipe found for " + itemName, data);
+                context.sendActionResult("No recipe found for " + itemName, data);
                 return;
             }
 
@@ -582,25 +576,25 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("resultName", best.recipe().outputItem());
             data.add("missing", missingRequirementsToJson(best.evaluation().missing()));
             if (best.evaluation().canCraft()) {
-                sendActionResult(requestId, "Yes, can craft " + best.recipe().outputItem() + ". Have all required ingredients.", data);
+                context.sendActionResult("Yes, can craft " + best.recipe().outputItem() + ". Have all required ingredients.", data);
                 return;
             }
 
-            sendActionResult(requestId, formatMissingRequirements(best), data);
+            context.sendActionResult(formatMissingRequirements(best), data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleCraftItem(String requestId, JsonObject args) {
+    private void handleCraftItem(ActionContext context, JsonObject args) {
         String outputItem = lower(getAsString(args, "outputItem"));
         int amount = getAsInt(args, "amount") != null ? Objects.requireNonNull(getAsInt(args, "amount")) : 1;
         if (outputItem == null || outputItem.isBlank()) {
-            sendError(requestId, "outputItem is required.");
+            context.sendError("outputItem is required.");
             return;
         }
         if (amount < 1) {
-            sendError(requestId, "amount must be a positive integer.");
+            context.sendError("amount must be a positive integer.");
             return;
         }
 
@@ -610,27 +604,27 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             data.addProperty("crafted", result.craftedCount() > 0);
             data.addProperty("outputItem", result.outputItem());
             data.addProperty("craftedCount", result.craftedCount());
-            sendActionResult(requestId, "Successfully crafted " + result.outputItem() + " " + result.craftedCount() + " time(s)", data);
+            context.sendActionResult("Successfully crafted " + result.outputItem() + " " + result.craftedCount() + " time(s)", data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleDetectGamemode(String requestId) {
+    private void handleDetectGamemode(ActionContext context) {
         try {
             String gameMode = callOnClientThread(this::readCurrentGamemode);
             JsonObject data = new JsonObject();
             data.addProperty("gameMode", gameMode);
-            sendActionResult(requestId, "Bot gamemode: \"" + gameMode + "\"", data);
+            context.sendActionResult("Bot gamemode: \"" + gameMode + "\"", data);
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void handleSendChat(String requestId, JsonObject args) {
+    private void handleSendChat(ActionContext context, JsonObject args) {
         String message = getAsString(args, "message");
         if (message == null || message.isBlank()) {
-            sendError(requestId, "message is required.");
+            context.sendError("message is required.");
             return;
         }
 
@@ -639,18 +633,22 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                 sendChatMessage(message);
                 return null;
             });
-            sendActionResult(requestId, "Sent message: \"" + message + "\"", new JsonObject());
+            context.sendActionResult("Sent message: \"" + message + "\"", new JsonObject());
         } catch (Exception error) {
-            sendError(requestId, error.getMessage());
+            context.sendError(error.getMessage());
         }
     }
 
-    private void sendHello() {
-        send(BridgeProtocolMessages.hello(PROTOCOL_VERSION, BRIDGE_VERSION));
+    private TaskServices taskServicesFor(ActionContext context) {
+        return new TaskServices(new TaskHooks(context));
     }
 
-    private void sendCapabilities() {
-        send(BridgeProtocolMessages.capabilities(
+    private void sendHello(ProtocolSession session) {
+        session.send(BridgeProtocolMessages.hello(PROTOCOL_VERSION, BRIDGE_VERSION));
+    }
+
+    private void sendCapabilities(ProtocolSession session) {
+        session.send(BridgeProtocolMessages.capabilities(
             PROTOCOL_VERSION,
             BRIDGE_VERSION,
             "1.21.11",
@@ -667,9 +665,9 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         ));
     }
 
-    private void sendSessionState() {
+    private void sendSessionState(ProtocolSession session) {
         SessionStateSnapshot snapshot = readSessionStateSnapshotSafely();
-        send(BridgeProtocolMessages.sessionState(
+        session.send(BridgeProtocolMessages.sessionState(
             snapshot.worldReady(),
             snapshot.connected(),
             snapshot.playerName(),
@@ -677,27 +675,15 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         ));
     }
 
-    private void sendRegistrySnapshot() {
-        send(BridgeProtocolMessages.registrySnapshot(
+    private void sendRegistrySnapshot(ProtocolSession session) {
+        session.send(BridgeProtocolMessages.registrySnapshot(
             Registries.BLOCK.getIds(),
             Registries.ITEM.getIds(),
             Registries.ENTITY_TYPE.getIds()
         ));
     }
 
-    private void sendActionResult(String requestId, String message, JsonElement data) {
-        send(BridgeProtocolMessages.actionResult(requestId, message, data));
-    }
-
-    private void sendError(String requestId, String message) {
-        send(BridgeProtocolMessages.error(requestId, message));
-    }
-
-    private void sendJobProgress(String channel, String message) {
-        send(BridgeProtocolMessages.chatEvent(channel, message));
-    }
-
-    private void send(JsonObject payload) {
+    private void sendToActive(JsonObject payload) {
         if (bridgeServer == null) {
             return;
         }
@@ -711,7 +697,13 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private void broadcastSessionState() {
-        sendSessionState();
+        SessionStateSnapshot snapshot = readSessionStateSnapshotSafely();
+        sendToActive(BridgeProtocolMessages.sessionState(
+            snapshot.worldReady(),
+            snapshot.connected(),
+            snapshot.playerName(),
+            snapshot.dimension()
+        ));
     }
 
     private void monitorWorldState() {
@@ -2216,20 +2208,20 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private final class BridgeActionHandler implements ActionDispatcher.Handler {
         @Override
         public void onActionRequest(ProtocolSession session, String requestId, String action, JsonObject args) {
-            handleActionRequest(requestId, action, args);
+            handleActionRequest(session, requestId, action, args);
         }
 
         @Override
         public void onHello(ProtocolSession session) {
-            sendHello();
-            sendCapabilities();
-            sendSessionState();
-            sendRegistrySnapshot();
+            sendHello(session);
+            sendCapabilities(session);
+            sendSessionState(session);
+            sendRegistrySnapshot(session);
         }
 
         @Override
         public void onProtocolError(ProtocolSession session, String requestId, String message) {
-            sendError(requestId, message);
+            session.send(BridgeProtocolMessages.error(requestId, message));
         }
 
         @Override
@@ -2261,6 +2253,12 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     }
 
     private final class TaskHooks implements TaskServices.Hooks {
+        private final ActionContext context;
+
+        private TaskHooks(ActionContext context) {
+            this.context = context;
+        }
+
         @Override
         public void digBlockSync(BlockPos pos) throws Exception {
             MinecraftMcpBridgeMod.this.digBlockSync(pos);
@@ -2298,7 +2296,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
 
         @Override
         public void sendJobProgress(String channel, String message) {
-            MinecraftMcpBridgeMod.this.sendJobProgress(channel, message);
+            context.sendJobProgress(channel, message);
         }
     }
 }
