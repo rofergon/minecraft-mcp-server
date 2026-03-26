@@ -315,7 +315,7 @@ export class ClientBridgeBackend implements GameBackend {
       const message = JSON.parse(line) as BridgeMessage;
       this.handleMessage(message);
 
-      if (message.type === 'hello' || message.type === 'capabilities' || message.type === 'session_state') {
+      if (message.type === 'capabilities' || message.type === 'session_state') {
         onReady();
       }
     } catch (error) {

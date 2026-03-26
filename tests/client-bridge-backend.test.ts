@@ -43,7 +43,11 @@ function deliverCapabilities(
 test.serial('client bridge backend completes handshake and performs action', async (t) => {
   const server = net.createServer();
   const port = 25571;
+  const sockets = new Set<net.Socket>();
   t.teardown(async () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
     await close(server);
   });
 
@@ -52,8 +56,14 @@ test.serial('client bridge backend completes handshake and performs action', asy
   let sawHello = false;
 
   server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.unref();
     socket.setEncoding('utf8');
     let buffer = '';
+
+    socket.on('close', () => {
+      sockets.delete(socket);
+    });
 
     socket.on('data', (chunk) => {
       buffer += chunk;
@@ -137,6 +147,91 @@ test.serial('client bridge backend completes handshake and performs action', asy
     entities: 1,
     namespaces: ['minecraft']
   });
+
+  backend.cleanup();
+});
+
+test.serial('client bridge waits for capabilities before reporting runtime state', async (t) => {
+  const server = net.createServer();
+  const port = 25572;
+  const sockets = new Set<net.Socket>();
+  t.teardown(async () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    await close(server);
+  });
+
+  await listen(server, port);
+
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.unref();
+    socket.setEncoding('utf8');
+    let buffer = '';
+
+    socket.on('close', () => {
+      sockets.delete(socket);
+    });
+
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf('\n');
+
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!line) {
+          newlineIndex = buffer.indexOf('\n');
+          continue;
+        }
+
+        const message = JSON.parse(line) as { type: string };
+
+        if (message.type === 'hello') {
+          socket.write(`${JSON.stringify({ type: 'hello', protocolVersion: '1.0.0', bridgeVersion: '0.1.0' })}\n`);
+          setTimeout(() => {
+            socket.write(`${JSON.stringify({
+              type: 'capabilities',
+              protocolVersion: '1.0.0',
+              bridgeVersion: '0.1.0',
+              minecraftVersion: '1.21.11',
+              loader: 'fabric',
+              loaderVersion: '0.18.4',
+              supportedActions: ['get-position'],
+              worldReady: true
+            })}\n`);
+          }, 50);
+        }
+
+        newlineIndex = buffer.indexOf('\n');
+      }
+    });
+  });
+
+  const backend = new ClientBridgeBackend({
+    backend: 'client-bridge',
+    host: 'localhost',
+    port: 25565,
+    username: 'LLMBot',
+    bridgeHost: '127.0.0.1',
+    bridgePort: port,
+    bridgeToken: undefined,
+    autoReconnect: false
+  }, {
+    onLog: () => undefined,
+    onChatMessage: () => undefined
+  });
+  t.teardown(() => backend.cleanup());
+
+  const connection = await backend.checkConnectionAndReconnect();
+  t.true(connection.connected);
+
+  const capabilities = await backend.getRuntimeCapabilities();
+  t.true(capabilities.worldReady);
+  t.is(capabilities.loader, 'fabric');
+
+  backend.cleanup();
 });
 
 test('client bridge registers only supported passthrough tools', (t) => {

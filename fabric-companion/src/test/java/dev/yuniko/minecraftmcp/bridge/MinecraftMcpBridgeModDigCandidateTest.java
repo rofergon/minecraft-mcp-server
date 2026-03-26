@@ -10,6 +10,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MinecraftMcpBridgeModDigCandidateTest {
     @Test
+    void preciseDigApproachRangeCapsLooseArrivalWindows() {
+        assertEquals(0.8D, MinecraftMcpBridgeMod.preciseDigApproachRange(3.4D));
+    }
+
+    @Test
+    void preciseDigApproachRangeKeepsAlreadyPreciseRanges() {
+        assertEquals(0.7D, MinecraftMcpBridgeMod.preciseDigApproachRange(0.7D));
+    }
+
+    @Test
     void maxDigCandidateVerticalDropCoversTallSurvivalLogs() {
         assertEquals(6, MinecraftMcpBridgeMod.maxDigCandidateVerticalDrop(4.5D, 1.62D));
     }

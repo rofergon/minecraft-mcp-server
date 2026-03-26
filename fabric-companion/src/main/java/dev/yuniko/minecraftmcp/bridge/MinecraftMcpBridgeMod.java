@@ -46,6 +46,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
     private static final String PROTOCOL_VERSION = "1.0.0";
     private static final String BRIDGE_VERSION = "0.1.0";
     private static final int SCAN_BATCH_SIZE = 2048;
+    private static final double PRECISE_DIG_APPROACH_RANGE = 0.8D;
     private static final BridgeRecipeCatalog RECIPE_CATALOG = BridgeRecipeCatalog.createDefault();
     private static final Set<String> CLEARABLE_FOLIAGE_BLOCKS = Set.of(
         "dead_bush",
@@ -812,6 +813,22 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         }
     }
 
+    private boolean ensureInventoryItemSelectedInHotbarOnClientThread(String query, int hotbarSlot) throws Exception {
+        ClientPlayerEntity player = requirePlayer();
+        InventoryItemSnapshot match = findMatchingInventoryItemSnapshot(query);
+        if (match == null) {
+            return false;
+        }
+
+        int targetHotbarSlot = resolveHotbarSlot(player, match.slot(), hotbarSlot);
+        if (match.slot() != targetHotbarSlot) {
+            swapInventorySlotIntoHotbar(player, match.slot(), targetHotbarSlot);
+        }
+
+        selectHotbarSlot(player, targetHotbarSlot);
+        return true;
+    }
+
     private InventoryItemSnapshot equipMatchingInventoryItem(String query) throws Exception {
         ClientPlayerEntity player = requirePlayer();
         InventoryItemSnapshot match = findMatchingInventoryItemSnapshot(query);
@@ -819,7 +836,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             throw new IllegalStateException("Could not equip '" + query + "'. Item not found in inventory.");
         }
 
-        int hotbarSlot = match.slot() < 9 ? match.slot() : chooseHotbarSlotForSwap(player, match.slot());
+        int hotbarSlot = resolveHotbarSlot(player, match.slot(), null);
         if (match.slot() != hotbarSlot) {
             swapInventorySlotIntoHotbar(player, match.slot(), hotbarSlot);
         }
@@ -832,6 +849,14 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             equipped.getCount(),
             hotbarSlot
         );
+    }
+
+    private int resolveHotbarSlot(ClientPlayerEntity player, int sourceSlot, Integer preferredHotbarSlot) {
+        if (preferredHotbarSlot != null && preferredHotbarSlot >= 0 && preferredHotbarSlot <= 8) {
+            return preferredHotbarSlot;
+        }
+
+        return sourceSlot < 9 ? sourceSlot : chooseHotbarSlotForSwap(player, sourceSlot);
     }
 
     private int chooseHotbarSlotForSwap(ClientPlayerEntity player, int sourceSlot) {
@@ -1772,7 +1797,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
             if (movementSafety.hazardous()) {
                 throw new IllegalStateException("Dig failed [hazard]: " + movementSafety.detail());
             }
-            navigationController.moveToPositionSync(candidate.standPosition(), candidate.range(), 15000L, true, true);
+            navigationController.moveToPositionSync(candidate.standPosition(), preciseDigApproachRange(candidate.range()), 15000L, true, true);
             break;
         }
 
@@ -1803,7 +1828,7 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
                     if (movementSafety.hazardous()) {
                         throw new IllegalStateException("Dig failed [hazard]: " + movementSafety.detail());
                     }
-                    navigationController.moveToPositionSync(candidate.standPosition(), candidate.range(), 8000L, true, true);
+                    navigationController.moveToPositionSync(candidate.standPosition(), preciseDigApproachRange(candidate.range()), 8000L, true, true);
                     continue;
                 }
 
@@ -1921,6 +1946,10 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         return candidates.stream()
             .min(Comparator.comparingDouble(DigCandidate::score))
             .orElse(null);
+    }
+
+    static double preciseDigApproachRange(double candidateRange) {
+        return Math.max(NavigationController.effectiveArrivalRange(0.0D), Math.min(candidateRange, PRECISE_DIG_APPROACH_RANGE));
     }
 
     private ReachabilityResult findReachability(ClientWorld world, Vec3d eyePosition, BlockPos pos, double reachDistance) {
@@ -2331,6 +2360,11 @@ public final class MinecraftMcpBridgeMod implements ClientModInitializer {
         @Override
         public int countMatchingInventoryItems(String targetItem) throws Exception {
             return callOnClientThread(() -> countMatchingInventoryItemsOnClientThread(targetItem));
+        }
+
+        @Override
+        public boolean ensureItemSelectedInHotbar(String targetItem, int hotbarSlot) throws Exception {
+            return callOnClientThread(() -> ensureInventoryItemSelectedInHotbarOnClientThread(targetItem, hotbarSlot));
         }
 
         @Override

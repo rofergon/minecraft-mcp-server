@@ -175,7 +175,7 @@ export const CLIENT_BRIDGE_PASSTHROUGH_TOOLS: ClientBridgeToolSpec[] = [
   },
   {
     name: 'mine-cobblestone',
-    description: 'Autonomously mine cobblestone until the requested amount is collected',
+    description: 'Autonomously mine cobblestone until the requested amount is collected. Requires a wooden_pickaxe in inventory and will ask the agent to craft/select it in hotbar slot 1 first when missing.',
     schema: {
       amount: z.number().int().min(1).describe('Target number of cobblestone items to collect'),
       maxRadius: z.coerce.number().int().min(4).max(96).optional().describe('Maximum horizontal search radius (default: 32)'),

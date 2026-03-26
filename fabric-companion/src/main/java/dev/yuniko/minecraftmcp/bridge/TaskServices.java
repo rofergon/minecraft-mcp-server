@@ -12,6 +12,7 @@ final class TaskServices {
         void moveToPosition(Vec3d target, double range, long timeoutMs, boolean allowJump, boolean clearSoftObstructions) throws Exception;
         int countMatchingLogsInInventory(String preferredType) throws Exception;
         int countMatchingInventoryItems(String targetItem) throws Exception;
+        boolean ensureItemSelectedInHotbar(String targetItem, int hotbarSlot) throws Exception;
         HarvestTarget findNearestHarvestTarget(String preferredType, int maxRadius, Set<BlockPos> ignoredTargets) throws Exception;
         MineTarget findNearestMineTarget(Set<String> blockTypes, int maxRadius, Set<BlockPos> ignoredTargets) throws Exception;
         BlockPos currentPlayerBlockPos() throws Exception;
@@ -86,6 +87,13 @@ final class TaskServices {
     }
 
     MineCobblestoneResult mineCobblestoneSync(int amount, int maxRadius, int reportEvery) throws Exception {
+        boolean preparedPickaxe = hooks.ensureItemSelectedInHotbar("wooden_pickaxe", 0);
+        if (!preparedPickaxe) {
+            throw new IllegalStateException(
+                "Cannot mine stone yet. Craft at least one wooden_pickaxe and select it in hotbar slot 1 before calling mine-cobblestone."
+            );
+        }
+
         Set<String> targetBlocks = Set.of("stone", "cobblestone");
         String targetItem = "cobblestone";
         int startingCount = hooks.countMatchingInventoryItems(targetItem);
